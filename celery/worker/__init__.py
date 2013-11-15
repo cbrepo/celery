@@ -18,38 +18,26 @@ import atexit
 import logging
 import socket
 import sys
-import time
+import threading
 import traceback
 
-from functools import partial
-
-from billiard import forking_enable
-from billiard.exceptions import WorkerLostError
-from kombu.syn import detect_environment
 from kombu.utils.finalize import Finalize
 
-from celery import concurrency as _concurrency
-from celery import platforms
-from celery.app import app_or_default, set_default_app
-from celery.app.abstract import configurated, from_config
-from celery.exceptions import SystemTerminate
-from celery.task import trace
-from celery.utils.functional import noop
-from celery.utils.imports import qualname, reload_from_cwd
-from celery.utils.log import get_logger
-from celery.utils.threads import Event
-from celery.utils.timer2 import Schedule
+from .. import abstract
+from .. import concurrency as _concurrency
+from .. import registry
+from ..app import app_or_default
+from ..app.abstract import configurated, from_config
+from ..exceptions import SystemTerminate
+from ..log import SilenceRepeated
+from ..utils import noop, qualname, reload_from_cwd
 
-from . import abstract
 from . import state
 from .buckets import TaskBucket, FastQueue
-from .hub import Hub, BoundedSemaphore
 
 RUN = 0x1
 CLOSE = 0x2
 TERMINATE = 0x3
-
-logger = get_logger(__name__)
 
 
 class Namespace(abstract.Namespace):
@@ -87,97 +75,43 @@ class Pool(abstract.StartStopComponent):
     name = "worker.pool"
     requires = ("queues", )
 
-    def __init__(self, w, autoscale=None, no_execv=False, **kwargs):
+    def __init__(self, w, autoscale=None, **kwargs):
         w.autoscale = autoscale
         w.pool = None
         w.max_concurrency = None
         w.min_concurrency = w.concurrency
-        w.no_execv = no_execv
         if w.autoscale:
             w.max_concurrency, w.min_concurrency = w.autoscale
 
-    def on_poll_init(self, pool, hub):
-        apply_after = hub.timer.apply_after
-        apply_at = hub.timer.apply_at
-        on_soft_timeout = pool.on_soft_timeout
-        on_hard_timeout = pool.on_hard_timeout
-        maintain_pool = pool.maintain_pool
-        add_reader = hub.add_reader
-        remove = hub.remove
-        now = time.time
-
-        if not pool.did_start_ok():
-            raise WorkerLostError("Could not start worker processes")
-
-        hub.update_readers(pool.readers)
-        for handler, interval in pool.timers.iteritems():
-            hub.timer.apply_interval(interval * 1000.0, handler)
-
-        def on_timeout_set(R, soft, hard):
-
-            def _on_soft_timeout():
-                if hard:
-                    R._tref = apply_at(now() + (hard - soft),
-                                       on_hard_timeout, (R, ))
-                    on_soft_timeout(R)
-            if soft:
-                R._tref = apply_after(soft * 1000.0, _on_soft_timeout)
-            elif hard:
-                R._tref = apply_after(hard * 1000.0,
-                                      on_hard_timeout, (R, ))
-
-        def on_timeout_cancel(result):
-            try:
-                result._tref.cancel()
-                delattr(result, "_tref")
-            except AttributeError:
-                pass
-
-        pool.init_callbacks(
-            on_process_up=lambda w: add_reader(w.sentinel, maintain_pool),
-            on_process_down=lambda w: remove(w.sentinel),
-            on_timeout_set=on_timeout_set,
-            on_timeout_cancel=on_timeout_cancel,
-        )
-
-    def create(self, w, semaphore=None, max_restarts=None):
-        threaded = not w.use_eventloop
-        forking_enable(not threaded or (w.no_execv or not w.force_execv))
-        procs = w.min_concurrency
-        if not threaded:
-            semaphore = w.semaphore = BoundedSemaphore(procs)
-            max_restarts = 100
+    def create(self, w):
         pool = w.pool = self.instantiate(w.pool_cls, w.min_concurrency,
-                            initargs=(w.app, w.hostname),
-                            maxtasksperchild=w.max_tasks_per_child,
-                            timeout=w.task_time_limit,
-                            soft_timeout=w.task_soft_time_limit,
-                            putlocks=w.pool_putlocks and threaded,
-                            lost_worker_timeout=w.worker_lost_wait,
-                            threads=threaded,
-                            max_restarts=max_restarts,
-                            semaphore=semaphore)
-        if w.hub:
-            w.hub.on_init.append(partial(self.on_poll_init, pool))
+                                logger=w.logger,
+                                initargs=(w.app, w.hostname),
+                                maxtasksperchild=w.max_tasks_per_child,
+                                timeout=w.task_time_limit,
+                                soft_timeout=w.task_soft_time_limit,
+                                putlocks=w.pool_putlocks,
+                                force_execv=w.force_execv)
         return pool
 
 
 class Beat(abstract.StartStopComponent):
     """Component used to embed a celerybeat process.
 
-    This will only be enabled if the ``beat``
+    This will only be enabled if the ``embed_clockservice``
     argument is set.
 
     """
     name = "worker.beat"
 
-    def __init__(self, w, beat=False, **kwargs):
-        self.enabled = w.beat = beat
+    def __init__(self, w, embed_clockservice=False, **kwargs):
+        self.enabled = w.embed_clockservice = embed_clockservice
         w.beat = None
 
     def create(self, w):
-        from celery.beat import EmbeddedService
+        from ..beat import EmbeddedService
         b = w.beat = EmbeddedService(app=w.app,
+                                     logger=w.logger,
                                      schedule_filename=w.schedule_filename,
                                      scheduler_cls=w.scheduler_cls)
         return b
@@ -187,41 +121,17 @@ class Queues(abstract.Component):
     """This component initializes the internal queues
     used by the worker."""
     name = "worker.queues"
-    requires = ("ev", )
 
     def create(self, w):
-        w.start_mediator = True
         if not w.pool_cls.rlimit_safe:
             w.disable_rate_limits = True
         if w.disable_rate_limits:
             w.ready_queue = FastQueue()
-            if w.use_eventloop:
-                w.start_mediator = False
-                if w.pool_putlocks and w.pool_cls.uses_semaphore:
-                    w.ready_queue.put = w.process_task_sem
-                else:
-                    w.ready_queue.put = w.process_task
-            elif not w.pool_cls.requires_mediator:
+            if not w.pool_cls.requires_mediator:
                 # just send task directly to pool, skip the mediator.
                 w.ready_queue.put = w.process_task
-                w.start_mediator = False
         else:
-            w.ready_queue = TaskBucket(task_registry=w.app.tasks)
-
-
-class EvLoop(abstract.StartStopComponent):
-    name = "worker.ev"
-
-    def __init__(self, w, **kwargs):
-        w.hub = None
-
-    def include_if(self, w):
-        return w.use_eventloop
-
-    def create(self, w):
-        w.timer = Schedule(max_interval=10)
-        hub = w.hub = Hub(w.timer)
-        return hub
+            w.ready_queue = TaskBucket(task_registry=registry.tasks)
 
 
 class Timers(abstract.Component):
@@ -229,24 +139,16 @@ class Timers(abstract.Component):
     name = "worker.timers"
     requires = ("pool", )
 
-    def include_if(self, w):
-        return not w.use_eventloop
-
     def create(self, w):
-        if not w.timer_cls:
+        w.priority_timer = self.instantiate(w.pool.Timer)
+        if not w.eta_scheduler_cls:
             # Default Timer is set by the pool, as e.g. eventlet
             # needs a custom implementation.
-            w.timer_cls = w.pool.Timer
-        w.timer = self.instantiate(w.pool.Timer,
-                                   max_interval=w.timer_precision,
-                                   on_timer_error=self.on_timer_error,
-                                   on_timer_tick=self.on_timer_tick)
-
-    def on_timer_error(self, exc):
-        logger.error("Timer error: %r", exc, exc_info=True)
-
-    def on_timer_tick(self, delay):
-        logger.debug("Timer wake-up! Next eta %s secs.", delay)
+            w.eta_scheduler_cls = w.pool.Timer
+        w.scheduler = self.instantiate(w.eta_scheduler_cls,
+                                precision=w.eta_scheduler_precision,
+                                on_error=w.on_timer_error,
+                                on_tick=w.on_timer_tick)
 
 
 class StateDB(abstract.Component):
@@ -268,7 +170,6 @@ class WorkController(configurated):
     CLOSE = CLOSE
     TERMINATE = TERMINATE
 
-    app = None
     concurrency = from_config()
     loglevel = logging.ERROR
     logfile = from_config("log_file")
@@ -276,8 +177,8 @@ class WorkController(configurated):
     pool_cls = from_config("pool")
     consumer_cls = from_config("consumer")
     mediator_cls = from_config("mediator")
-    timer_cls = from_config("timer")
-    timer_precision = from_config("timer_precision")
+    eta_scheduler_cls = from_config("eta_scheduler")
+    eta_scheduler_precision = from_config()
     autoscaler_cls = from_config("autoscaler")
     autoreloader_cls = from_config("autoreloader")
     schedule_filename = from_config()
@@ -290,60 +191,49 @@ class WorkController(configurated):
     prefetch_multiplier = from_config()
     state_db = from_config()
     disable_rate_limits = from_config()
-    worker_lost_wait = from_config()
 
     _state = None
     _running = 0
 
-    def __init__(self, loglevel=None, hostname=None, ready_callback=noop,
-            queues=None, app=None, pidfile=None, **kwargs):
-        self.app = app_or_default(app or self.app)
-        # all new threads start without a current app, so if an app is not
-        # passed on to the thread it will fall back to the "default app",
-        # which then could be the wrong app.  So for the worker
-        # we set this to always return our app.  This is a hack,
-        # and means that only a single app can be used for workers
-        # running in the same process.
-        set_default_app(self.app)
-        self.app.finalize()
-        trace._tasks = self.app._tasks
-
-        self._shutdown_complete = Event()
+    def __init__(self, loglevel=None, hostname=None, logger=None,
+            ready_callback=noop,
+            queues=None, app=None, **kwargs):
+        self.app = app_or_default(app)
+        self._shutdown_complete = threading.Event()
         self.setup_defaults(kwargs, namespace="celeryd")
         self.app.select_queues(queues)  # select queues subset.
 
         # Options
         self.loglevel = loglevel or self.loglevel
+        self.logger = self.app.log.get_default_logger()
         self.hostname = hostname or socket.gethostname()
         self.ready_callback = ready_callback
+        self.timer_debug = SilenceRepeated(self.logger.debug,
+                                           max_iterations=10)
         self._finalize = Finalize(self, self.stop, exitpriority=1)
-        self.pidfile = pidfile
-        self.pidlock = None
-        self.use_eventloop = (detect_environment() == "default" and
-                              self.app.broker_connection().is_evented)
+        self._finalize_db = None
 
         # Initialize boot steps
         self.pool_cls = _concurrency.get_implementation(self.pool_cls)
         self.components = []
-        self.namespace = Namespace(app=self.app).apply(self, **kwargs)
+        self.namespace = Namespace(app=self.app,
+                                   logger=self.logger).apply(self, **kwargs)
 
     def start(self):
         """Starts the workers main loop."""
         self._state = self.RUN
-        if self.pidfile:
-            self.pidlock = platforms.create_pidlock(self.pidfile)
+
         try:
             for i, component in enumerate(self.components):
-                logger.debug("Starting %s...", qualname(component))
+                self.logger.debug("Starting %s...", qualname(component))
                 self._running = i + 1
-                if component:
-                    component.start()
-                logger.debug("%s OK!", qualname(component))
+                component.start()
+                self.logger.debug("%s OK!", qualname(component))
         except SystemTerminate:
             self.terminate()
         except Exception, exc:
-            logger.error("Unrecoverable error: %r", exc,
-                         exc_info=True)
+            self.logger.error("Unrecoverable error: %r", exc,
+                              exc_info=True)
             self.stop()
         except (KeyboardInterrupt, SystemExit):
             self.stop()
@@ -352,16 +242,15 @@ class WorkController(configurated):
         # makes sure all greenthreads have exited.
         self._shutdown_complete.wait()
 
-    def process_task_sem(self, req):
-        return self.semaphore.acquire(self.process_task, req)
-
-    def process_task(self, req):
+    def process_task(self, request):
         """Process task by sending it to the pool of workers."""
         try:
-            req.execute_using_pool(self.pool)
+            request.task.execute(request, self.pool,
+                                 self.loglevel, self.logfile)
         except Exception, exc:
-            logger.critical("Internal error: %r\n%s",
-                            exc, traceback.format_exc(), exc_info=True)
+            self.logger.critical("Internal error %s: %s\n%s",
+                                 exc.__class__, exc, traceback.format_exc(),
+                                 exc_info=True)
         except SystemTerminate:
             self.terminate()
             raise
@@ -369,21 +258,13 @@ class WorkController(configurated):
             self.stop()
             raise exc
 
-    def signal_consumer_close(self):
-        try:
-            self.consumer.close()
-        except AttributeError:
-            pass
-
     def stop(self, in_sighandler=False):
         """Graceful shutdown of the worker server."""
-        self.signal_consumer_close()
         if not in_sighandler or self.pool.signal_safe:
             self._shutdown(warm=True)
 
     def terminate(self, in_sighandler=False):
         """Not so graceful shutdown of the worker server."""
-        self.signal_consumer_close()
         if not in_sighandler or self.pool.signal_safe:
             self._shutdown(warm=False)
 
@@ -393,29 +274,24 @@ class WorkController(configurated):
         if self._state in (self.CLOSE, self.TERMINATE):
             return
 
-        if self.pool:
-            self.pool.close()
-
         if self._state != self.RUN or self._running != len(self.components):
             # Not fully started, can safely exit.
             self._state = self.TERMINATE
             self._shutdown_complete.set()
             return
+
         self._state = self.CLOSE
 
         for component in reversed(self.components):
-            logger.debug("%s %s...", what, qualname(component))
-            if component:
-                stop = component.stop
-                if not warm:
-                    stop = getattr(component, "terminate", None) or stop
-                stop()
+            self.logger.debug("%s %s...", what, qualname(component))
+            stop = component.stop
+            if not warm:
+                stop = getattr(component, "terminate", None) or stop
+            stop()
 
-        self.timer.stop()
+        self.priority_timer.stop()
         self.consumer.close_connection()
 
-        if self.pidlock:
-            self.pidlock.release()
         self._state = self.TERMINATE
         self._shutdown_complete.set()
 
@@ -425,12 +301,18 @@ class WorkController(configurated):
 
         for module in set(modules or ()):
             if module not in sys.modules:
-                logger.debug("importing module %s", module)
+                self.logger.debug("importing module %s", module)
                 imp(module)
             elif reload:
-                logger.debug("reloading module %s", module)
+                self.logger.debug("reloading module %s", module)
                 reload_from_cwd(sys.modules[module], reloader)
         self.pool.restart()
+
+    def on_timer_error(self, einfo):
+        self.logger.error("Timer error: %r", einfo[1], exc_info=einfo)
+
+    def on_timer_tick(self, delay):
+        self.timer_debug("Scheduler wake-up! Next eta %s secs.", delay)
 
     @property
     def state(self):

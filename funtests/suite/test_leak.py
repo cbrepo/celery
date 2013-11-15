@@ -82,7 +82,7 @@ class LeakFunCase(unittest.TestCase):
                     base, sizes.average(), sizes, ))
                 raise
         finally:
-            self.app.control.purge()
+            self.app.control.discard_all()
 
 
 class test_leaks(LeakFunCase):

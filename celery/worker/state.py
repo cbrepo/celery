@@ -20,9 +20,9 @@ import shelve
 
 from collections import defaultdict
 
-from celery import __version__
-from celery.datastructures import LimitedSet
-from celery.utils import cached_property
+from .. import __version__
+from ..datastructures import LimitedSet
+from ..utils import cached_property
 
 #: Worker software/platform information.
 SOFTWARE_INFO = {"sw_ident": "celeryd",
@@ -51,14 +51,11 @@ revoked = LimitedSet(maxlen=REVOKES_MAX, expires=REVOKE_EXPIRES)
 #: Updates global state when a task has been reserved.
 task_reserved = reserved_requests.add
 
-should_stop = False
-should_terminate = False
-
 
 def task_accepted(request):
     """Updates global state when a task has been accepted."""
     active_requests.add(request)
-    total_count[request.name] += 1
+    total_count[request.task_name] += 1
 
 
 def task_ready(request):
@@ -67,58 +64,30 @@ def task_ready(request):
     reserved_requests.discard(request)
 
 
-C_BENCH = os.environ.get("C_BENCH") or os.environ.get("CELERY_BENCH")
-if C_BENCH:  # pragma: no cover
-    import atexit
-
+if os.environ.get("CELERY_BENCH"):  # pragma: no cover
     from time import time
-    from billiard import current_process
-    from celery.utils.debug import memdump, sample_mem
 
     all_count = 0
-    bench_first = None
     bench_start = None
-    bench_last = None
     bench_every = int(os.environ.get("CELERY_BENCH_EVERY", 1000))
-    bench_sample = []
     __reserved = task_reserved
     __ready = task_ready
 
-    if current_process()._name == 'MainProcess':
-        @atexit.register
-        def on_shutdown():
-            if bench_first is not None and bench_last is not None:
-                print("- Time spent in benchmark: %r" % (
-                    bench_last - bench_first))
-                print("- Avg: %s" % (sum(bench_sample) / len(bench_sample)))
-                memdump()
-
     def task_reserved(request):  # noqa
         global bench_start
-        global bench_first
-        now = None
         if bench_start is None:
-            bench_start = now = time()
-        if bench_first is None:
-            bench_first = now
-
+            bench_start = time()
         return __reserved(request)
 
-    import sys
     def task_ready(request):  # noqa
-        global all_count
-        global bench_start
-        global bench_last
+        global all_count, bench_start
         all_count += 1
         if not all_count % bench_every:
-            now = time()
-            diff = now - bench_start
-            print("- Time spent processing %s tasks (since first "
-                    "task received): ~%.4fs\n" % (bench_every, diff))
-            sys.stdout.flush()
-            bench_start = bench_last = now
-            bench_sample.append(diff)
-            sample_mem()
+            print("* Time spent processing %s tasks (since first "
+                    "task received): ~%.4fs\n" % (
+                bench_every, time() - bench_start))
+            bench_start = None
+
         return __ready(request)
 
 

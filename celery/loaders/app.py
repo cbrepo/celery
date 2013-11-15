@@ -15,4 +15,9 @@ from .base import BaseLoader
 
 
 class AppLoader(BaseLoader):
-    pass
+
+    def on_worker_init(self):
+        self.import_default_modules()
+
+    def read_configuration(self):
+        return {}

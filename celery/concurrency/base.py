@@ -5,12 +5,9 @@ import logging
 import os
 import time
 
-from kombu.utils.encoding import safe_repr
-
-from celery.utils import timer2
-from celery.utils.log import get_logger
-
-logger = get_logger("celery.concurrency")
+from .. import log
+from ..utils import timer2
+from ..utils.encoding import safe_repr
 
 
 def apply_target(target, args=(), kwargs={}, callback=None,
@@ -46,20 +43,15 @@ class BasePool(object):
     _state = None
     _pool = None
 
-    #: only used by multiprocessing pool
-    uses_semaphore = False
-
-    def __init__(self, limit=None, putlocks=True, **options):
+    def __init__(self, limit=None, putlocks=True, logger=None, **options):
         self.limit = limit
         self.putlocks = putlocks
+        self.logger = logger or log.get_default_logger()
         self.options = options
-        self._does_debug = logger.isEnabledFor(logging.DEBUG)
+        self._does_debug = self.logger.isEnabledFor(logging.DEBUG)
 
     def on_start(self):
         pass
-
-    def did_start_ok(self):
-        return True
 
     def on_stop(self):
         pass
@@ -68,15 +60,6 @@ class BasePool(object):
         pass
 
     def on_terminate(self):
-        pass
-
-    def on_soft_timeout(self, job):
-        pass
-
-    def on_hard_timeout(self, job):
-        pass
-
-    def maintain_pool(self, *args, **kwargs):
         pass
 
     def terminate_job(self, pid):
@@ -88,6 +71,7 @@ class BasePool(object):
                 "%s does not implement restart" % (self.__class__, ))
 
     def stop(self):
+        self._state = self.CLOSE
         self.on_stop()
         self._state = self.TERMINATE
 
@@ -99,16 +83,6 @@ class BasePool(object):
         self.on_start()
         self._state = self.RUN
 
-    def close(self):
-        self._state = self.CLOSE
-        self.on_close()
-
-    def on_close(self):
-        pass
-
-    def init_callbacks(self, **kwargs):
-        pass
-
     def apply_async(self, target, args=[], kwargs={}, **options):
         """Equivalent of the :func:`apply` built-in function.
 
@@ -117,8 +91,8 @@ class BasePool(object):
 
         """
         if self._does_debug:
-            logger.debug("TaskPool: Apply %s (args:%s kwargs:%s)",
-                         target, safe_repr(args), safe_repr(kwargs))
+            self.logger.debug("TaskPool: Apply %s (args:%s kwargs:%s)",
+                            target, safe_repr(args), safe_repr(kwargs))
 
         return self.on_apply(target, args, kwargs,
                              waitforslot=self.putlocks,
@@ -138,15 +112,3 @@ class BasePool(object):
     @property
     def num_processes(self):
         return self.limit
-
-    @property
-    def readers(self):
-        return {}
-
-    @property
-    def writers(self):
-        return {}
-
-    @property
-    def timers(self):
-        return {}

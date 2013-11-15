@@ -11,22 +11,23 @@
 """
 from __future__ import absolute_import
 
-import anyjson
 import importlib
 import os
 import re
+import traceback
+import warnings
 
+from anyjson import deserialize
 from datetime import datetime
 
-from kombu.utils.encoding import safe_str
+from ..datastructures import DictAttribute
+from ..exceptions import ImproperlyConfigured
+from ..utils import (cached_property, get_cls_by_name,
+                     import_from_cwd as _import_from_cwd)
+from ..utils.functional import maybe_list
+from ..utils.encoding import safe_str
 
-from celery.datastructures import DictAttribute
-from celery.exceptions import ImproperlyConfigured
-from celery.utils import cached_property
-from celery.utils.imports import import_from_cwd, symbol_by_name
-from celery.utils.functional import maybe_list
-
-BUILTIN_MODULES = frozenset()
+BUILTIN_MODULES = frozenset(["celery.task"])
 
 ERROR_ENVVAR_NOT_SET = (
 """The environment variable %r is not set,
@@ -60,7 +61,7 @@ class BaseLoader(object):
     _conf = None
 
     def __init__(self, app=None, **kwargs):
-        from celery.app import app_or_default
+        from ..app import app_or_default
         self.app = app_or_default(app)
         self.task_modules = set()
 
@@ -94,20 +95,18 @@ class BaseLoader(object):
         return importlib.import_module(module, package=package)
 
     def import_from_cwd(self, module, imp=None, package=None):
-        return import_from_cwd(module,
+        return _import_from_cwd(module,
                 self.import_module if imp is None else imp,
                 package=package)
 
     def import_default_modules(self):
-        return [self.import_task_module(m)
-            for m in set(maybe_list(self.app.conf.CELERY_IMPORTS))
-                   | set(maybe_list(self.app.conf.CELERY_INCLUDE))
-                   | self.builtin_modules]
+        imports = set(maybe_list(self.conf.get("CELERY_IMPORTS") or ()))
+        return [self.import_task_module(module)
+                    for module in imports | self.builtin_modules]
 
     def init_worker(self):
         if not self.worker_initialized:
             self.worker_initialized = True
-            self.import_default_modules()
             self.on_worker_init()
 
     def init_worker_process(self):
@@ -125,7 +124,7 @@ class BaseLoader(object):
         if isinstance(obj, basestring):
             try:
                 if "." in obj:
-                    obj = symbol_by_name(obj, imp=self.import_from_cwd)
+                    obj = get_cls_by_name(obj, imp=self.import_from_cwd)
                 else:
                     obj = self.import_from_cwd(obj)
             except (ImportError, AttributeError):
@@ -139,11 +138,11 @@ class BaseLoader(object):
 
     def cmdline_config_parser(self, args, namespace="celery",
                 re_type=re.compile(r"\((\w+)\)"),
-                extra_types={"json": anyjson.loads},
+                extra_types={"json": deserialize},
                 override_types={"tuple": "json",
                                 "list": "json",
                                 "dict": "json"}):
-        from celery.app.defaults import Option, NAMESPACES
+        from ..app.defaults import Option, NAMESPACES
         namespace = namespace.upper()
         typemap = dict(Option.typemap, **extra_types)
 
@@ -187,17 +186,22 @@ class BaseLoader(object):
             sender=None, to=None, host=None, port=None,
             user=None, password=None, timeout=None,
             use_ssl=False, use_tls=False):
-        message = self.mail.Message(sender=sender, to=to,
-                                    subject=safe_str(subject),
-                                    body=safe_str(body))
-        mailer = self.mail.Mailer(host=host, port=port,
-                                  user=user, password=password,
-                                  timeout=timeout, use_ssl=use_ssl,
-                                  use_tls=use_tls)
-        mailer.send(message, fail_silently=fail_silently)
-
-    def read_configuration(self):
-        return {}
+        try:
+            message = self.mail.Message(sender=sender, to=to,
+                                        subject=safe_str(subject),
+                                        body=safe_str(body))
+            mailer = self.mail.Mailer(host=host, port=port,
+                                      user=user, password=password,
+                                      timeout=timeout, use_ssl=use_ssl,
+                                      use_tls=use_tls)
+            mailer.send(message)
+        except Exception, exc:
+            if not fail_silently:
+                raise
+            warnings.warn(self.mail.SendmailWarning(
+                "Mail could not be sent: %r %r\n%r" % (
+                    exc, {"To": to, "Subject": subject},
+                    traceback.format_stack())))
 
     @property
     def conf(self):

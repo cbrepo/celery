@@ -48,7 +48,7 @@ signal).
 If the worker won't shutdown after considerate time, for example because
 of tasks stuck in an infinite-loop, you can use the :sig:`KILL` signal to
 force terminate the worker, but be aware that currently executing tasks will
-be lost (unless the tasks have the :attr:`~@Task.acks_late`
+be lost (unless the tasks have the :attr:`~celery.task.base.Task.acks_late`
 option set).
 
 Also as processes can't override the :sig:`KILL` signal, the worker will
@@ -69,14 +69,6 @@ restart the worker using the :sig:`HUP` signal::
 
 The worker will then replace itself with a new instance using the same
 arguments as it was started with.
-
-.. note::
-
-    This will only work if ``celeryd`` is running in the background as
-    a daemon (it does not have a controlling terminal).
-
-    Restarting by HUP is disabled on OS X because of a limitation on
-    that platform.
 
 .. _worker-concurrency:
 
@@ -111,18 +103,12 @@ specify a file for these to be stored in, either by using the `--statedb`
 argument to :mod:`~celery.bin.celeryd` or the :setting:`CELERYD_STATE_DB`
 setting.  See :setting:`CELERYD_STATE_DB` for more information.
 
-Note that remote control commands must be working for revokes to work.
-Remote control commands are only supported by the amqp, redis and mongodb
-transports at this point.
-
 .. _worker-time-limits:
 
 Time limits
 ===========
 
 .. versionadded:: 2.0
-
-:supported pools: processes
 
 A single task can potentially run forever, if you have lots of tasks
 waiting for some event that will never happen you will block the worker
@@ -137,10 +123,10 @@ time limit kills it:
 
 .. code-block:: python
 
-    from myapp import celery
+    from celery.task import task
     from celery.exceptions import SoftTimeLimitExceeded
 
-    @celery.task
+    @task()
     def mytask():
         try:
             do_work()
@@ -167,8 +153,9 @@ Example changing the time limit for the ``tasks.crawl_the_web`` task
 to have a soft time limit of one minute, and a hard time limit of
 two minutes::
 
-    >>> celery.control.time_limit("tasks.crawl_the_web",
-                                  soft=60, hard=120, reply=True)
+    >>> from celery.task import control
+    >>> control.time_limit("tasks.crawl_the_web",
+                           soft=60, hard=120, reply=True)
     [{'worker1.example.com': {'ok': 'time limits set successfully'}}]
 
 Only tasks that starts executing after the time limit change will be affected.
@@ -179,8 +166,6 @@ Max tasks per child setting
 ===========================
 
 .. versionadded:: 2.0
-
-:supported pools: processes
 
 With this option you can configure the maximum number of tasks
 a worker can execute before it's replaced by a new process.
@@ -197,8 +182,6 @@ Autoreloading
 =============
 
 .. versionadded:: 2.5
-
-:supported pools: processes, eventlet, gevent, threads, solo
 
 Starting :program:`celeryd` with the :option:`--autoreload` option will
 enable the worker to watch for file system changes to all imported task
@@ -249,9 +232,6 @@ Remote control
 
 .. versionadded:: 2.0
 
-:supported pools: processes, eventlet, gevent, blocking:threads/solo (see note)
-:supported transports: amqp, redis, mongodb
-
 Workers have the ability to be remote controlled using a high-priority
 broadcast message queue.  The commands can be directed to all, or a specific
 list of workers.
@@ -276,35 +256,27 @@ to the number of destination hosts.
     commands from the command line.  It supports all of the commands
     listed below.  See :ref:`monitoring-celeryctl` for more information.
 
-.. note::
-
-    The solo and threads pool supports remote control commands,
-    but any task executing will block any waiting control command,
-    so it is of limited use if the worker is very busy.  In that
-    case you must increase the timeout waitin for replies in the client.
-
 .. _worker-broadcast-fun:
 
-The :meth:`~@control.broadcast` function.
+The :func:`~celery.task.control.broadcast` function.
 ----------------------------------------------------
 
 This is the client function used to send commands to the workers.
 Some remote control commands also have higher-level interfaces using
-:meth:`~@control.broadcast` in the background, like
-:meth:`~@control.rate_limit` and :meth:`~@control.ping`.
+:func:`~celery.task.control.broadcast` in the background, like
+:func:`~celery.task.control.rate_limit` and :func:`~celery.task.control.ping`.
 
 Sending the :control:`rate_limit` command and keyword arguments::
 
     >>> from celery.task.control import broadcast
-    >>> celery.control.broadcast("rate_limit",
-    ...                          arguments={"task_name": "myapp.mytask",
-    ...                                     "rate_limit": "200/m"})
+    >>> broadcast("rate_limit", arguments={"task_name": "myapp.mytask",
+    ...                                    "rate_limit": "200/m"})
 
 This will send the command asynchronously, without waiting for a reply.
 To request a reply you have to use the `reply` argument::
 
-    >>> celery.control.broadcast("rate_limit", {
-    ...     "task_name": "myapp.mytask", "rate_limit": "200/m"}, reply=True)
+    >>> broadcast("rate_limit", {"task_name": "myapp.mytask",
+    ...                          "rate_limit": "200/m"}, reply=True)
     [{'worker1.example.com': 'New rate limit set successfully'},
      {'worker2.example.com': 'New rate limit set successfully'},
      {'worker3.example.com': 'New rate limit set successfully'}]
@@ -312,16 +284,16 @@ To request a reply you have to use the `reply` argument::
 Using the `destination` argument you can specify a list of workers
 to receive the command::
 
-    >>> celery.control.broadcast("rate_limit", {
-    ...     "task_name": "myapp.mytask",
-    ...     "rate_limit": "200/m"}, reply=True,
-    ...                             destination=["worker1.example.com"])
+    >>> broadcast
+    >>> broadcast("rate_limit", {"task_name": "myapp.mytask",
+    ...                          "rate_limit": "200/m"}, reply=True,
+    ...           destination=["worker1.example.com"])
     [{'worker1.example.com': 'New rate limit set successfully'}]
 
 
 Of course, using the higher-level interface to set rate limits is much
 more convenient, but there are commands that can only be requested
-using :meth:`~@control.broadcast`.
+using :func:`~celery.task.control.broadcast`.
 
 .. _worker-rate-limits:
 
@@ -333,12 +305,13 @@ Rate limits
 Example changing the rate limit for the `myapp.mytask` task to accept
 200 tasks a minute on all servers::
 
-    >>> celery.control.rate_limit("myapp.mytask", "200/m")
+    >>> from celery.task.control import rate_limit
+    >>> rate_limit("myapp.mytask", "200/m")
 
 Example changing the rate limit on a single host by specifying the
 destination host name::
 
-    >>> celery.control.rate_limit("myapp.mytask", "200/m",
+    >>> rate_limit("myapp.mytask", "200/m",
     ...            destination=["worker1.example.com"])
 
 .. warning::
@@ -371,13 +344,14 @@ Terminating a task also revokes it.
 
 ::
 
-    >>> celery.control.revoke("d9078da5-9915-40a0-bfa1-392c7bde42ed")
+    >>> from celery.task.control import revoke
+    >>> revoke("d9078da5-9915-40a0-bfa1-392c7bde42ed")
 
-    >>> celery.control.revoke("d9078da5-9915-40a0-bfa1-392c7bde42ed",
-    ...                       terminate=True)
+    >>> revoke("d9078da5-9915-40a0-bfa1-392c7bde42ed",
+    ...        terminate=True)
 
-    >>> celery.control.revoke("d9078da5-9915-40a0-bfa1-392c7bde42ed",
-    ...                       terminate=True, signal="SIGKILL")
+    >>> revoke("d9078da5-9915-40a0-bfa1-392c7bde42ed",
+    ...        terminate=True, signal="SIGKILL")
 
 .. control:: shutdown
 
@@ -386,8 +360,8 @@ Remote shutdown
 
 This command will gracefully shut down the worker remotely::
 
-    >>> celery.control.broadcast("shutdown") # shutdown all workers
-    >>> celery.control.broadcast("shutdown, destination="worker1.example.com")
+    >>> broadcast("shutdown") # shutdown all workers
+    >>> broadcast("shutdown, destination="worker1.example.com")
 
 .. control:: ping
 
@@ -399,12 +373,13 @@ The workers reply with the string 'pong', and that's just about it.
 It will use the default one second timeout for replies unless you specify
 a custom timeout::
 
-    >>> celery.control.ping(timeout=0.5)
+    >>> from celery.task.control import ping
+    >>> ping(timeout=0.5)
     [{'worker1.example.com': 'pong'},
      {'worker2.example.com': 'pong'},
      {'worker3.example.com': 'pong'}]
 
-:meth:`~@control.ping` also supports the `destination` argument,
+:func:`~celery.task.control.ping` also supports the `destination` argument,
 so you can specify which workers to ping::
 
     >>> ping(['worker2.example.com', 'worker3.example.com'])
@@ -425,8 +400,8 @@ a worker using :program:`celeryev`/:program:`celerymon`.
 
 .. code-block:: python
 
-    >>> celery.control.broadcast("enable_events")
-    >>> celery.control.broadcast("disable_events")
+    >>> broadcast("enable_events")
+    >>> broadcast("disable_events")
 
 Adding/Reloading modules
 ------------------------
@@ -447,23 +422,21 @@ being imported by the worker processes:
 .. code-block:: python
 
     >>> from celery.task.control import broadcast
-    >>> celery.control.broadcast("pool_restart",
-    ...                          arguments={"modules": ["foo", "bar"]})
+    >>> broadcast("pool_restart", arguments={"modules": ["foo", "bar"]})
 
 Use the ``reload`` argument to reload modules it has already imported:
 
 .. code-block:: python
 
-    >>> celery.control.broadcast("pool_restart",
-    ...                          arguments={"modules": ["foo"],
-    ...                                     "reload": True})
+    >>> broadcast("pool_restart", arguments={"modules": ["foo"],
+                                             "reload": True})
 
 If you don't specify any modules then all known tasks modules will
 be imported/reloaded:
 
 .. code-block:: python
 
-    >>> celery.control.broadcast("pool_restart", arguments={"reload": True})
+    >>> broadcast("pool_restart", arguments={"reload": True})
 
 The ``modules`` argument is a list of modules to modify. ``reload``
 specifies whether to reload modules if they have previously been imported.
@@ -517,20 +490,22 @@ then import them using the :setting:`CELERY_IMPORTS` setting::
 Inspecting workers
 ==================
 
-:class:`@control.inspect` lets you inspect running workers.  It
+:class:`celery.task.control.inspect` lets you inspect running workers.  It
 uses remote control commands under the hood.
 
 .. code-block:: python
 
+    >>> from celery.task.control import inspect
+
     # Inspect all nodes.
-    >>> i = celery.control.inspect()
+    >>> i = inspect()
 
     # Specify multiple nodes to inspect.
-    >>> i = celery.control.inspect(["worker1.example.com",
-                                    "worker2.example.com"])
+    >>> i = inspect(["worker1.example.com", "worker2.example.com"])
 
     # Specify a single node to inspect.
-    >>> i = celery.control.inspect("worker1.example.com")
+    >>> i = inspect("worker1.example.com")
+
 
 .. _worker-inspect-registered-tasks:
 
@@ -538,7 +513,7 @@ Dump of registered tasks
 ------------------------
 
 You can get a list of tasks registered in the worker using the
-:meth:`~@control.inspect.registered`::
+:meth:`~celery.task.control.inspect.registered`::
 
     >>> i.registered()
     [{'worker1.example.com': ['celery.delete_expired_task_meta',
@@ -555,7 +530,7 @@ Dump of currently executing tasks
 ---------------------------------
 
 You can get a list of active tasks using
-:meth:`~@control.inspect.active`::
+:meth:`~celery.task.control.inspect.active`::
 
     >>> i.active()
     [{'worker1.example.com':
@@ -570,7 +545,7 @@ Dump of scheduled (ETA) tasks
 -----------------------------
 
 You can get a list of tasks waiting to be scheduled by using
-:meth:`~@control.inspect.scheduled`::
+:meth:`~celery.task.control.inspect.scheduled`::
 
     >>> i.scheduled()
     [{'worker1.example.com':
@@ -598,7 +573,7 @@ Reserved tasks are tasks that has been received, but is still waiting to be
 executed.
 
 You can get a list of these using
-:meth:`~@control.inspect.reserved`::
+:meth:`~celery.task.control.inspect.reserved`::
 
     >>> i.reserved()
     [{'worker1.example.com':

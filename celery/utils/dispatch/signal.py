@@ -3,18 +3,23 @@
 from __future__ import absolute_import
 
 import weakref
+try:
+    set
+except NameError:
+    from sets import Set as set                 # Python 2.3 fallback
+
 from . import saferef
 
 WEAKREF_TYPES = (weakref.ReferenceType, saferef.BoundMethodWeakref)
 
 
-def _make_id(target):  # pragma: no cover
+def _make_id(target):
     if hasattr(target, 'im_func'):
         return (id(target.im_self), id(target.im_func))
     return id(target)
 
 
-class Signal(object):  # pragma: no cover
+class Signal(object):
     """Base class for all signals
 
 
@@ -78,7 +83,7 @@ class Signal(object):  # pragma: no cover
 
                 if weak:
                     receiver = saferef.safe_ref(receiver,
-                                    on_delete=self._remove_receiver)
+                                            on_delete=self._remove_receiver)
 
                 for r_key, _ in self.receivers:
                     if r_key == lookup_key:

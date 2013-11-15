@@ -11,5 +11,4 @@
     introduction
     brokers/index
     first-steps-with-celery
-    next-steps
     resources

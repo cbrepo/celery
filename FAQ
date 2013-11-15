@@ -259,8 +259,8 @@ Why won't my periodic task run?
 
 .. _faq-purge-the-queue:
 
-How do I purge all waiting tasks?
----------------------------------
+How do I discard all waiting tasks?
+------------------------------------
 
 **Answer:** You can use celeryctl to purge all configured task queues::
 
@@ -268,8 +268,8 @@ How do I purge all waiting tasks?
 
 or programatically::
 
-        >>> from celery import current_app as celery
-        >>> celery.control.purge()
+        >>> from celery.task.control import discard_all
+        >>> discard_all()
         1753
 
 If you only want to purge messages from a specific queue
@@ -284,8 +284,8 @@ You can also start :mod:`~celery.bin.celeryd` with the
 
 .. _faq-messages-left-after-purge:
 
-I've purged messages, but there are still messages left in the queue?
----------------------------------------------------------------------
+I've discarded messages, but there are still messages left in the queue?
+------------------------------------------------------------------------
 
 **Answer:** Tasks are acknowledged (removed from the queue) as soon
 as they are actually executed. After the worker has received a task, it will
@@ -295,8 +295,8 @@ held on to by the worker until it closes the connection to the broker (AMQP
 server). When that connection is closed (e.g. because the worker was stopped)
 the tasks will be re-sent by the broker to the next available worker (or the
 same worker when it has been restarted), so to properly purge the queue of
-waiting tasks you have to stop all the workers, and then purge the tasks
-using :func:`celery.control.purge`.
+waiting tasks you have to stop all the workers, and then discard the tasks
+using :func:`~celery.task.control.discard_all`.
 
 .. _faq-results:
 
@@ -414,7 +414,7 @@ If you don't use the results for a task, make sure you set the
 
 .. code-block python
 
-    @celery.task(ignore_result=True)
+    @task(ignore_result=True)
     def mytask():
         ...
 
@@ -479,14 +479,14 @@ Why do workers delete tasks from the queue if they are unable to process them?
 ------------------------------------------------------------------------------
 **Answer**:
 
-The worker rejects unknown tasks, messages with encoding errors and messages
+The worker discards unknown tasks, messages with encoding errors and messages
 that doesn't contain the proper fields (as per the task message protocol).
 
-If it did not reject them they could be redelivered again and again,
+If it did not ack (delete) them, they would be redelivered again and again
 causing a loop.
 
-Recent versions of RabbitMQ has the ability to configure a dead-letter
-queue for exchange, so that rejected messages is moved there.
+There has been talk about moving these messages to a dead-letter queue,
+but that has not yet been implemented.
 
 .. _faq-execute-task-by-name:
 
@@ -508,7 +508,7 @@ How can I get the task id of the current task?
 
 **Answer**: The current id and more is available in the task request::
 
-    @celery.task
+    @task
     def mytask():
         cache.set(mytask.request.id, "Running")
 
@@ -550,7 +550,7 @@ Also, a common pattern is to use callback tasks:
 
 .. code-block:: python
 
-    @celery.task()
+    @task()
     def add(x, y, callback=None):
         result = x + y
         if callback:
@@ -558,7 +558,7 @@ Also, a common pattern is to use callback tasks:
         return result
 
 
-    @celery.task(ignore_result=True)
+    @task(ignore_result=True)
     def log_result(result, **kwargs):
         logger = log_result.get_logger(**kwargs)
         logger.info("log_result got: %s" % (result, ))
@@ -580,8 +580,8 @@ Can I cancel the execution of a task?
 
 or if you only have the task id::
 
-    >>> from celery import current_app as celery
-    >>> celery.control.revoke(task_id)
+    >>> from celery.task.control import revoke
+    >>> revoke(task_id)
 
 .. _faq-node-not-receiving-broadcast-commands:
 
@@ -667,7 +667,7 @@ this is rarely the case. Imagine the following task:
 
 .. code-block:: python
 
-    @celery.task()
+    @task()
     def process_upload(filename, tmpfile):
         # Increment a file count stored in a database
         increment_file_counter()
@@ -780,7 +780,7 @@ celeryd keeps spawning processes at startup
 **Answer**: This is a known issue on Windows.
 You have to start celeryd with the command::
 
-    $ python -m celery.bin.celeryd
+    $ python -m celeryd.bin.celeryd
 
 Any additional arguments can be appended to this command.
 

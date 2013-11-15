@@ -26,8 +26,8 @@ from Queue import Queue, Empty
 
 from kombu.utils.limits import TokenBucket
 
-from celery.utils import timeutils
-from celery.utils.compat import zip_longest, chain_from_iterable
+from ..utils import timeutils
+from ..utils.compat import zip_longest, chain_from_iterable
 
 
 class RateLimitExceeded(Exception):
@@ -72,9 +72,9 @@ class TaskBucket(object):
     def put(self, request):
         """Put a :class:`~celery.worker.job.Request` into
         the appropiate bucket."""
-        if request.name not in self.buckets:
-            self.add_bucket_for_type(request.name)
-        self.buckets[request.name].put_nowait(request)
+        if request.task_name not in self.buckets:
+            self.add_bucket_for_type(request.task_name)
+        self.buckets[request.task_name].put_nowait(request)
         with self.mutex:
             self.not_empty.notify()
     put_nowait = put

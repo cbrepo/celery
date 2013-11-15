@@ -6,6 +6,9 @@
 """
 from __future__ import absolute_import
 
+if __name__ == "__main__" and globals.get("__package__") is None:
+    __package__ = "celery.bin.celeryctl"
+
 import cmd
 import sys
 import shlex
@@ -15,14 +18,19 @@ from itertools import count
 
 from amqplib import client_0_8 as amqp
 
-from celery.app import app_or_default
-from celery.utils.functional import padlist
+from ..app import app_or_default
+from ..utils import padlist
 
-from celery.bin.base import Command
-from celery.utils import strtobool
+from .base import Command
+
+# Valid string -> bool coercions.
+BOOLS = {"1": True, "0": False,
+         "on": True, "off": False,
+         "yes": True, "no": False,
+         "true": True, "False": False}
 
 # Map to coerce strings to other types.
-COERCE = {bool: strtobool}
+COERCE = {bool: lambda value: BOOLS[value.lower()]}
 
 HELP_HEADER = """
 Commands
@@ -35,8 +43,8 @@ Example:
 """
 
 
-def say(m, fh=sys.stderr):
-    fh.write("%s\n" % (m, ))
+def say(m):
+    sys.stderr.write("%s\n" % (m, ))
 
 
 class Spec(object):
@@ -192,17 +200,13 @@ class AMQShell(cmd.Cmd):
     def __init__(self, *args, **kwargs):
         self.connect = kwargs.pop("connect")
         self.silent = kwargs.pop("silent", False)
-        self.out = kwargs.pop("out", sys.stderr)
         cmd.Cmd.__init__(self, *args, **kwargs)
         self._reconnect()
 
-    def note(self, m):
+    def say(self, m):
         """Say something to the user. Disabled if :attr:`silent`."""
         if not self.silent:
-            say(m, fh=self.out)
-
-    def say(self, m):
-        say(m, fh=self.out)
+            say(m)
 
     def get_amqp_api_command(self, cmd, arglist):
         """With a command name and a list of arguments, convert the arguments
@@ -228,24 +232,24 @@ class AMQShell(cmd.Cmd):
 
     def do_exit(self, *args):
         """The `"exit"` command."""
-        self.note("\n-> please, don't leave!")
+        self.say("\n-> please, don't leave!")
         sys.exit(0)
 
     def display_command_help(self, cmd, short=False):
         spec = self.amqp[cmd]
-        self.say("%s %s" % (cmd, spec.format_signature()))
+        say("%s %s" % (cmd, spec.format_signature()))
 
     def do_help(self, *args):
         if not args:
-            self.say(HELP_HEADER)
+            say(HELP_HEADER)
             for cmd_name in self.amqp.keys():
                 self.display_command_help(cmd_name, short=True)
-            self.say(EXAMPLE_TEXT)
+            say(EXAMPLE_TEXT)
         else:
             self.display_command_help(args[0])
 
     def default(self, line):
-        self.say("unknown syntax: '%s'. how about some 'help'?" % line)
+        say("unknown syntax: '%s'. how about some 'help'?" % line)
 
     def get_names(self):
         return set(self.builtins) | set(self.amqp)
@@ -306,21 +310,21 @@ class AMQShell(cmd.Cmd):
             except (AttributeError, KeyError), exc:
                 self.default(line)
             except Exception, exc:
-                self.say(exc)
+                say(exc)
                 self.needs_reconnect = True
 
     def respond(self, retval):
         """What to do with the return value of a command."""
         if retval is not None:
             if isinstance(retval, basestring):
-                self.say(retval)
+                say(retval)
             else:
-                self.say(pprint.pformat(retval))
+                pprint.pprint(retval)
 
     def _reconnect(self):
         """Re-establish connection to the AMQP server."""
         self.conn = self.connect(self.conn)
-        self.chan = self.conn.default_channel
+        self.chan = self.conn.channel()
         self.needs_reconnect = False
 
     @property
@@ -330,36 +334,36 @@ class AMQShell(cmd.Cmd):
 
 class AMQPAdmin(object):
     """The celery :program:`camqadm` utility."""
-    Shell = AMQShell
 
     def __init__(self, *args, **kwargs):
         self.app = app_or_default(kwargs.get("app"))
-        self.out = kwargs.setdefault("out", sys.stderr)
-        self.silent = kwargs.get("silent")
+        self.silent = bool(args)
+        if "silent" in kwargs:
+            self.silent = kwargs["silent"]
         self.args = args
 
     def connect(self, conn=None):
         if conn:
             conn.close()
         conn = self.app.broker_connection()
-        self.note("-> connecting to %s." % conn.as_uri())
+        self.say("-> connecting to %s." % conn.as_uri())
         conn.connect()
-        self.note("-> connected.")
+        self.say("-> connected.")
         return conn
 
     def run(self):
-        shell = self.Shell(connect=self.connect, out=self.out)
+        shell = AMQShell(connect=self.connect)
         if self.args:
             return shell.onecmd(" ".join(self.args))
         try:
             return shell.cmdloop()
         except KeyboardInterrupt:
-            self.note("(bibi)")
+            self.say("(bibi)")
             pass
 
-    def note(self, m):
+    def say(self, m):
         if not self.silent:
-            say(m, fh=self.out)
+            say(m)
 
 
 class AMQPAdminCommand(Command):
@@ -376,5 +380,5 @@ def camqadm(*args, **options):
 def main():
     AMQPAdminCommand().execute_from_commandline()
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":              # pragma: no cover
     main()

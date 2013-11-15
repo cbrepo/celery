@@ -5,219 +5,120 @@
 
     The task implementation has been moved to :mod:`celery.app.task`.
 
-    This contains the backward compatible Task class used in the old API.
-
     :copyright: (c) 2009 - 2012 by Ask Solem.
     :license: BSD, see LICENSE for more details.
 
 """
 from __future__ import absolute_import
 
-from kombu import Exchange
+from .. import current_app
+from ..app.task import Context, TaskType, BaseTask  # noqa
+from ..schedules import maybe_schedule
+from ..utils import timeutils
 
-from celery import current_app
-from celery.__compat__ import class_property, reclassmethod
-from celery.app.task import Context, TaskType, Task as BaseTask  # noqa
-from celery.schedules import maybe_schedule
-
-#: list of methods that must be classmethods in the old API.
-_COMPAT_CLASSMETHODS = (
-    "delay", "apply_async", "retry", "apply",
-    "AsyncResult", "subtask", "push_request", "pop_request")
-
-
-class Task(BaseTask):
-    """Deprecated Task base class.
-
-    Modern applications should use :class:`celery.Task` instead.
-
-    """
-    abstract = True
-    __bound__ = False
-
-    #- Deprecated compat. attributes -:
-
-    queue = None
-    routing_key = None
-    exchange = None
-    exchange_type = None
-    delivery_mode = None
-    mandatory = False
-    immediate = False
-    priority = None
-    type = "regular"
-    error_whitelist = ()
-    disable_error_emails = False
-
-    from_config = BaseTask.from_config + (
-        ("exchange_type", "CELERY_DEFAULT_EXCHANGE_TYPE"),
-        ("delivery_mode", "CELERY_DEFAULT_DELIVERY_MODE"),
-        ("error_whitelist", "CELERY_TASK_ERROR_WHITELIST"),
-    )
-
-    # In old Celery the @task decorator didn't exist, so one would create
-    # classes instead and use them directly (e.g. MyTask.apply_async()).
-    # the use of classmethods was a hack so that it was not necessary
-    # to instantiate the class before using it, but it has only
-    # given us pain (like all magic).
-    for name in _COMPAT_CLASSMETHODS:
-        locals()[name] = reclassmethod(getattr(BaseTask, name))
-
-    @classmethod
-    def _get_request(self):
-        return self.request_stack.top
-    request = class_property(_get_request)
-
-    #: Deprecated alias to :attr:`logger``.
-    get_logger = reclassmethod(BaseTask._get_logger)
-
-    @classmethod
-    def establish_connection(self, connect_timeout=None):
-        """Deprecated method used to get a broker connection.
-
-        Should be replaced with :meth:`@Celery.broker_connection`
-        instead, or by acquiring connections from the connection pool:
-
-        .. code-block:: python
-
-            # using the connection pool
-            with celery.pool.acquire(block=True) as conn:
-                ...
-
-            # establish fresh connection
-            with celery.broker_connection() as conn:
-                ...
-        """
-        return self._get_app().broker_connection(
-                connect_timeout=connect_timeout)
-
-    def get_publisher(self, connection=None, exchange=None,
-            connect_timeout=None, exchange_type=None, **options):
-        """Deprecated method to get the task publisher (now called producer).
-
-        Should be replaced with :class:`@amqp.TaskProducer`:
-
-        .. code-block:: python
-
-            with celery.broker_connection() as conn:
-                with celery.amqp.TaskProducer(conn) as prod:
-                    my_task.apply_async(producer=prod)
-
-        """
-        exchange = self.exchange if exchange is None else exchange
-        if exchange_type is None:
-            exchange_type = self.exchange_type
-        connection = connection or self.establish_connection(connect_timeout)
-        return self._get_app().amqp.TaskProducer(connection,
-                exchange=exchange and Exchange(exchange, exchange_type),
-                routing_key=self.routing_key, **options)
-
-    @classmethod
-    def get_consumer(self, connection=None, queues=None, **kwargs):
-        """Deprecated method used to get consumer for the queue
-        this task is sent to.
-
-        Should be replaced with :class:`@amqp.TaskConsumer` instead:
-
-        """
-        Q = self._get_app().amqp
-        connection = connection or self.establish_connection()
-        if queues is None:
-            queues = Q.queues[self.queue] if self.queue else Q.default_queue
-        return Q.TaskConsumer(connection, queues, **kwargs)
+Task = current_app.Task
 
 
 class PeriodicTask(Task):
-    """A periodic task is a task that adds itself to the
-    :setting:`CELERYBEAT_SCHEDULE` setting."""
+    """A periodic task is a task that behaves like a :manpage:`cron` job.
+
+    Results of periodic tasks are not stored by default.
+
+    .. attribute:: run_every
+
+        *REQUIRED* Defines how often the task is run (its interval),
+        it can be a :class:`~datetime.timedelta` object, a
+        :class:`~celery.schedules.crontab` object or an integer
+        specifying the time in seconds.
+
+    .. attribute:: relative
+
+        If set to :const:`True`, run times are relative to the time when the
+        server was started. This was the previous behaviour, periodic tasks
+        are now scheduled by the clock.
+
+    :raises NotImplementedError: if the :attr:`run_every` attribute is
+        not defined.
+
+    Example
+
+        >>> from celery.task import tasks, PeriodicTask
+        >>> from datetime import timedelta
+        >>> class EveryThirtySecondsTask(PeriodicTask):
+        ...     run_every = timedelta(seconds=30)
+        ...
+        ...     def run(self, **kwargs):
+        ...         logger = self.get_logger(**kwargs)
+        ...         logger.info("Execute every 30 seconds")
+
+        >>> from celery.task import PeriodicTask
+        >>> from celery.schedules import crontab
+
+        >>> class EveryMondayMorningTask(PeriodicTask):
+        ...     run_every = crontab(hour=7, minute=30, day_of_week=1)
+        ...
+        ...     def run(self, **kwargs):
+        ...         logger = self.get_logger(**kwargs)
+        ...         logger.info("Execute every Monday at 7:30AM.")
+
+        >>> class EveryMorningTask(PeriodicTask):
+        ...     run_every = crontab(hours=7, minute=30)
+        ...
+        ...     def run(self, **kwargs):
+        ...         logger = self.get_logger(**kwargs)
+        ...         logger.info("Execute every day at 7:30AM.")
+
+        >>> class EveryQuarterPastTheHourTask(PeriodicTask):
+        ...     run_every = crontab(minute=15)
+        ...
+        ...     def run(self, **kwargs):
+        ...         logger = self.get_logger(**kwargs)
+        ...         logger.info("Execute every 0:15 past the hour every day.")
+
+    """
     abstract = True
     ignore_result = True
+    type = "periodic"
     relative = False
     options = None
-    compat = True
 
     def __init__(self):
+        app = current_app
         if not hasattr(self, "run_every"):
             raise NotImplementedError(
                     "Periodic tasks must have a run_every attribute")
         self.run_every = maybe_schedule(self.run_every, self.relative)
-        super(PeriodicTask, self).__init__()
 
-    @classmethod
-    def on_bound(cls, app):
-        app.conf.CELERYBEAT_SCHEDULE[cls.name] = {
-                "task": cls.name,
-                "schedule": cls.run_every,
+        # For backward compatibility, add the periodic task to the
+        # configuration schedule instead.
+        app.conf.CELERYBEAT_SCHEDULE[self.name] = {
+                "task": self.name,
+                "schedule": self.run_every,
                 "args": (),
                 "kwargs": {},
-                "options": cls.options or {},
-                "relative": cls.relative,
+                "options": self.options or {},
+                "relative": self.relative,
         }
 
+        super(PeriodicTask, self).__init__()
 
-def task(*args, **kwargs):
-    """Decorator to create a task class out of any callable.
+    def timedelta_seconds(self, delta):
+        """Convert :class:`~datetime.timedelta` to seconds.
 
-    **Examples**
+        Doesn't account for negative timedeltas.
 
-    .. code-block:: python
+        """
+        return timeutils.timedelta_seconds(delta)
 
-        @task
-        def refresh_feed(url):
-            return Feed.objects.get(url=url).refresh()
+    def is_due(self, last_run_at):
+        """Returns tuple of two items `(is_due, next_time_to_run)`,
+        where next time to run is in seconds.
 
-    With setting extra options and using retry.
+        See :meth:`celery.schedules.schedule.is_due` for more information.
 
-    .. code-block:: python
+        """
+        return self.run_every.is_due(last_run_at)
 
-        @task(max_retries=10)
-        def refresh_feed(url):
-            try:
-                return Feed.objects.get(url=url).refresh()
-            except socket.error, exc:
-                refresh_feed.retry(exc=exc)
-
-    Calling the resulting task:
-
-            >>> refresh_feed("http://example.com/rss") # Regular
-            <Feed: http://example.com/rss>
-            >>> refresh_feed.delay("http://example.com/rss") # Async
-            <AsyncResult: 8998d0f4-da0b-4669-ba03-d5ab5ac6ad5d>
-    """
-    return current_app.task(*args, **dict({"accept_magic_kwargs": False,
-                                           "base": Task}, **kwargs))
-
-
-def periodic_task(*args, **options):
-    """Decorator to create a task class out of any callable.
-
-        .. admonition:: Examples
-
-            .. code-block:: python
-
-                @task
-                def refresh_feed(url):
-                    return Feed.objects.get(url=url).refresh()
-
-            With setting extra options and using retry.
-
-            .. code-block:: python
-
-                from celery.task import current
-
-                @task(exchange="feeds")
-                def refresh_feed(url):
-                    try:
-                        return Feed.objects.get(url=url).refresh()
-                    except socket.error, exc:
-                        current.retry(exc=exc)
-
-            Calling the resulting task:
-
-                >>> refresh_feed("http://example.com/rss") # Regular
-                <Feed: http://example.com/rss>
-                >>> refresh_feed.delay("http://example.com/rss") # Async
-                <AsyncResult: 8998d0f4-da0b-4669-ba03-d5ab5ac6ad5d>
-
-    """
-    return task(**dict({"base": PeriodicTask}, **options))
+    def remaining_estimate(self, last_run_at):
+        """Returns when the periodic task should run next as a timedelta."""
+        return self.run_every.remaining_estimate(last_run_at)

@@ -1,6 +1,6 @@
 from django.http import HttpResponse
 
-from anyjson import dumps
+from anyjson import serialize
 
 
 def multiply(request):
@@ -9,4 +9,4 @@ def multiply(request):
 
     retval = x * y
     response = {"status": "success", "retval": retval}
-    return HttpResponse(dumps(response), mimetype="application/json")
+    return HttpResponse(serialize(response), mimetype="application/json")

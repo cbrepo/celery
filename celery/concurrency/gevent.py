@@ -6,9 +6,11 @@ if not os.environ.get("GEVENT_NOPATCH"):
     from gevent import monkey
     monkey.patch_all()
 
+import sys
+
 from time import time
 
-from celery.utils import timer2
+from ..utils import timer2
 
 from .base import apply_target, BasePool
 
@@ -28,8 +30,18 @@ class Schedule(timer2.Schedule):
         super(Schedule, self).__init__(*args, **kwargs)
         self._queue = set()
 
-    def _enter(self, eta, priority, entry):
-        secs = max(eta - time(), 0)
+    def enter(self, entry, eta=None, priority=0):
+        try:
+            eta = timer2.to_timestamp(eta)
+        except OverflowError:
+            if not self.handle_error(sys.exc_info()):
+                raise
+
+        now = time()
+        if eta is None:
+            eta = now
+        secs = max(eta - now, 0)
+
         g = self._Greenlet.spawn_later(secs, entry)
         self._queue.add(g)
         g.link(self._entry_exit)
@@ -37,6 +49,7 @@ class Schedule(timer2.Schedule):
         g.eta = eta
         g.priority = priority
         g.cancelled = False
+
         return g
 
     def _entry_exit(self, g):
@@ -87,7 +100,6 @@ class TaskPool(BasePool):
 
     def on_start(self):
         self._pool = self.Pool(self.limit)
-        self._quick_put = self._pool.spawn
 
     def on_stop(self):
         if self._pool is not None:
@@ -95,8 +107,8 @@ class TaskPool(BasePool):
 
     def on_apply(self, target, args=None, kwargs=None, callback=None,
             accept_callback=None, **_):
-        return self._quick_put(apply_target, target, args, kwargs,
-                               callback, accept_callback)
+        return self._pool.spawn(apply_target, target, args, kwargs,
+                                callback, accept_callback)
 
     def grow(self, n=1):
         self._pool._semaphore.counter += n

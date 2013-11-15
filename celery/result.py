@@ -14,78 +14,57 @@ from __future__ import with_statement
 
 import time
 
-from collections import deque
 from copy import copy
 from itertools import imap
 
 from . import current_app
 from . import states
 from .app import app_or_default
-from .datastructures import DependencyGraph
-from .exceptions import IncompleteStream, TimeoutError
-from .utils import cached_property
+from .exceptions import TimeoutError
+from .registry import _unpickle_task
 from .utils.compat import OrderedDict
 
 
-def from_serializable(r):
-    # earlier backends may just pickle, so check if
-    # result is already prepared.
-    if not isinstance(r, ResultBase):
-        id, nodes = r
-        if nodes:
-            return TaskSetResult(id, [AsyncResult(id) for id, _ in nodes])
-        return AsyncResult(id)
-    return r
+def _unpickle_result(task_id, task_name):
+    return _unpickle_task(task_name).AsyncResult(task_id)
 
 
-class ResultBase(object):
-    """Base class for all results"""
-
-
-class AsyncResult(ResultBase):
+class AsyncResult(object):
     """Query task state.
 
-    :param id: see :attr:`id`.
+    :param task_id: see :attr:`task_id`.
     :keyword backend: see :attr:`backend`.
 
     """
-    app = None
 
     #: Error raised for timeouts.
     TimeoutError = TimeoutError
 
-    #: The task's UUID.
-    id = None
+    #: The task uuid.
+    task_id = None
 
     #: The task result backend to use.
     backend = None
 
-    #: Parent result (if part of a chain)
-    parent = None
-
-    def __init__(self, id, backend=None, task_name=None,
-            app=None, parent=None):
-        self.app = app_or_default(app or self.app)
-        self.id = id
+    def __init__(self, task_id, backend=None, task_name=None, app=None):
+        self.app = app_or_default(app)
+        self.task_id = task_id
         self.backend = backend or self.app.backend
         self.task_name = task_name
-        self.parent = parent
-
-    def serializable(self):
-        return self.id, None
 
     def forget(self):
         """Forget about (and possibly remove the result of) this task."""
-        self.backend.forget(self.id)
+        self.backend.forget(self.task_id)
 
-    def revoke(self, connection=None):
+    def revoke(self, connection=None, connect_timeout=None):
         """Send revoke signal to all workers.
 
         Any worker receiving the task, or having reserved the
         task, *must* ignore it.
 
         """
-        self.app.control.revoke(self.id, connection=connection)
+        self.app.control.revoke(self.task_id, connection=connection,
+                                connect_timeout=connect_timeout)
 
     def get(self, timeout=None, propagate=True, interval=0.5):
         """Wait until task is ready, and return its result.
@@ -111,61 +90,10 @@ class AsyncResult(ResultBase):
         be re-raised.
 
         """
-        return self.backend.wait_for(self.id, timeout=timeout,
-                                              propagate=propagate,
-                                              interval=interval)
+        return self.backend.wait_for(self.task_id, timeout=timeout,
+                                                   propagate=propagate,
+                                                   interval=interval)
     wait = get  # deprecated alias to :meth:`get`.
-
-    def collect(self, intermediate=False, **kwargs):
-        """Iterator, like :meth:`get` will wait for the task to complete,
-        but will also follow :class:`AsyncResult` and :class:`ResultSet`
-        returned by the task, yielding for each result in the tree.
-
-        An example would be having the following tasks:
-
-        .. code-block:: python
-
-            @task
-            def A(how_many):
-                return TaskSet(B.s(i) for i in xrange(how_many))
-
-            @task
-            def B(i):
-                return pow2.delay(i)
-
-            @task
-            def pow2(i):
-                return i ** 2
-
-        Calling :meth:`collect` would return:
-
-        .. code-block:: python
-
-            >>> result = A.delay(10)
-            >>> list(result.collect())
-            [0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
-
-        """
-        for _, R in self.iterdeps():
-            yield R, R.get(**kwargs)
-
-    def get_leaf(self):
-        value = None
-        for _, R in self.iterdeps():
-            value = R.get()
-        return value
-
-    def iterdeps(self, intermediate=False):
-        stack = deque([(None, self)])
-
-        while stack:
-            parent, node = stack.popleft()
-            yield parent, node
-            if node.ready():
-                stack.extend((node, child) for child in node.children or [])
-            else:
-                if not intermediate:
-                    raise IncompleteStream()
 
     def ready(self):
         """Returns :const:`True` if the task has been executed.
@@ -184,72 +112,44 @@ class AsyncResult(ResultBase):
         """Returns :const:`True` if the task failed."""
         return self.state == states.FAILURE
 
-    def build_graph(self, intermediate=False):
-        graph = DependencyGraph()
-        for parent, node in self.iterdeps(intermediate=intermediate):
-            if parent:
-                graph.add_arc(parent)
-                graph.add_edge(parent, node)
-        return graph
-
     def __str__(self):
-        """`str(self) -> self.id`"""
-        return self.id
+        """`str(self) -> self.task_id`"""
+        return self.task_id
 
     def __hash__(self):
-        """`hash(self) -> hash(self.id)`"""
-        return hash(self.id)
+        """`hash(self) -> hash(self.task_id)`"""
+        return hash(self.task_id)
 
     def __repr__(self):
-        return "<%s: %s>" % (self.__class__.__name__, self.id)
+        return "<AsyncResult: %s>" % self.task_id
 
     def __eq__(self, other):
-        if isinstance(other, AsyncResult):
-            return other.id == self.id
-        elif isinstance(other, basestring):
-            return other == self.id
-        return NotImplemented
+        if isinstance(other, self.__class__):
+            return self.task_id == other.task_id
+        return other == self.task_id
 
     def __copy__(self):
-        r = self.__reduce__()
-        return r[0](*r[1])
+        return self.__class__(self.task_id, backend=self.backend)
 
     def __reduce__(self):
-        return self.__class__, self.__reduce_args__()
-
-    def __reduce_args__(self):
-        return self.id, self.backend, self.task_name, self.parent
-
-    def set_parent(self, parent):
-        self.parent = parent
-        return parent
-
-    @cached_property
-    def graph(self):
-        return self.build_graph()
-
-    @property
-    def supports_native_join(self):
-        return self.backend.supports_native_join
-
-    @property
-    def children(self):
-        children = self.backend.get_children(self.id)
-        if children:
-            return map(from_serializable, children)
+        if self.task_name:
+            return (_unpickle_result, (self.task_id, self.task_name))
+        else:
+            return (self.__class__, (self.task_id, self.backend,
+                                     None, self.app))
 
     @property
     def result(self):
         """When the task has been executed, this contains the return value.
         If the task raised an exception, this will be the exception
         instance."""
-        return self.backend.get_result(self.id)
+        return self.backend.get_result(self.task_id)
     info = result
 
     @property
     def traceback(self):
         """Get the traceback of a failed task."""
-        return self.backend.get_traceback(self.id)
+        return self.backend.get_traceback(self.task_id)
 
     @property
     def state(self):
@@ -281,31 +181,23 @@ class AsyncResult(ResultBase):
                 then contains the tasks return value.
 
         """
-        return self.backend.get_status(self.id)
+        return self.backend.get_status(self.task_id)
     status = state
-
-    def _get_task_id(self):
-        return self.id
-
-    def _set_task_id(self, id):
-        self.id = id
-    task_id = property(_get_task_id, _set_task_id)
 BaseAsyncResult = AsyncResult  # for backwards compatibility.
 
 
-class ResultSet(ResultBase):
+class ResultSet(object):
     """Working with more than one result.
 
     :param results: List of result instances.
 
     """
-    app = None
 
     #: List of results in in the set.
     results = None
 
     def __init__(self, results, app=None, **kwargs):
-        self.app = app_or_default(app or self.app)
+        self.app = app_or_default(app)
         self.results = results
 
     def add(self, result):
@@ -399,9 +291,9 @@ class ResultSet(ResultBase):
         for result in self.results:
             result.forget()
 
-    def revoke(self, connection=None):
+    def revoke(self, connection=None, connect_timeout=None):
         """Revoke all tasks in the set."""
-        with self.app.default_connection(connection) as conn:
+        with self.app.default_connection(connection, connect_timeout) as conn:
             for result in self.results:
                 result.revoke(connection=conn)
 
@@ -420,7 +312,7 @@ class ResultSet(ResultBase):
 
         """
         elapsed = 0.0
-        results = OrderedDict((result.id, copy(result))
+        results = OrderedDict((result.task_id, copy(result))
                                 for result in self.results)
 
         while results:
@@ -439,17 +331,6 @@ class ResultSet(ResultBase):
             elapsed += interval
             if timeout and elapsed >= timeout:
                 raise TimeoutError("The operation timed out")
-
-    def get(self, timeout=None, propagate=True, interval=0.5):
-        """See :meth:`join`
-
-        This is here for API compatibility with :class:`AsyncResult`,
-        in addition it uses :meth:`join_native` if available for the
-        current result backend.
-
-        """
-        return (self.join_native if self.supports_native_join else self.join)(
-                    timeout=timeout, propagate=propagate, interval=interval)
 
     def join(self, timeout=None, propagate=True, interval=0.5):
         """Gathers the results of all tasks as a list in order.
@@ -493,9 +374,9 @@ class ResultSet(ResultBase):
                 remaining = timeout - (time.time() - time_start)
                 if remaining <= 0.0:
                     raise TimeoutError("join operation timed out")
-            results.append(result.get(timeout=remaining,
-                                      propagate=propagate,
-                                      interval=interval))
+            results.append(result.wait(timeout=remaining,
+                                       propagate=propagate,
+                                       interval=interval))
         return results
 
     def iter_native(self, timeout=None, interval=None):
@@ -511,7 +392,7 @@ class ResultSet(ResultBase):
 
         """
         backend = self.results[0].backend
-        ids = [result.id for result in self.results]
+        ids = [result.task_id for result in self.results]
         return backend.get_many(ids, timeout=timeout, interval=interval)
 
     def join_native(self, timeout=None, propagate=True, interval=0.5):
@@ -536,15 +417,6 @@ class ResultSet(ResultBase):
     def __len__(self):
         return len(self.results)
 
-    def __eq__(self, other):
-        if isinstance(other, ResultSet):
-            return other.results == self.results
-        return NotImplemented
-
-    def __repr__(self):
-        return "<%s: %r>" % (self.__class__.__name__,
-                             [r.id for r in self.results])
-
     @property
     def total(self):
         """Deprecated: Use ``len(r)``."""
@@ -557,7 +429,7 @@ class ResultSet(ResultBase):
 
     @property
     def supports_native_join(self):
-        return self.results[0].supports_native_join
+        return self.results[0].backend.supports_native_join
 
 
 class TaskSetResult(ResultSet):
@@ -567,24 +439,24 @@ class TaskSetResult(ResultSet):
     It enables inspection of the tasks state and return values as
     a single entity.
 
-    :param id: The id of the taskset.
+    :param taskset_id: The id of the taskset.
     :param results: List of result instances.
 
     """
 
     #: The UUID of the taskset.
-    id = None
+    taskset_id = None
 
     #: List/iterator of results in the taskset
     results = None
 
-    def __init__(self, id, results=None, **kwargs):
-        self.id = id
+    def __init__(self, taskset_id, results=None, **kwargs):
+        self.taskset_id = taskset_id
 
         # XXX previously the "results" arg was named "subtasks".
         if "subtasks" in kwargs:
             results = kwargs["subtasks"]
-        ResultSet.__init__(self, results, **kwargs)
+        super(TaskSetResult, self).__init__(results, **kwargs)
 
     def save(self, backend=None):
         """Save taskset result for later retrieval using :meth:`restore`.
@@ -595,61 +467,38 @@ class TaskSetResult(ResultSet):
             >>> result = TaskSetResult.restore(taskset_id)
 
         """
-        return (backend or self.app.backend).save_taskset(self.id, self)
+        return (backend or self.app.backend).save_taskset(self.taskset_id,
+                                                          self)
 
     def delete(self, backend=None):
         """Remove this result if it was previously saved."""
-        (backend or self.app.backend).delete_taskset(self.id)
+        (backend or self.app.backend).delete_taskset(self.taskset_id)
 
     def itersubtasks(self):
         """Depreacted.   Use ``iter(self.results)`` instead."""
         return iter(self.results)
 
     def __reduce__(self):
-        return self.__class__, self.__reduce_args__()
-
-    def __reduce_args__(self):
-        return self.id, self.results
-
-    def __eq__(self, other):
-        if isinstance(other, TaskSetResult):
-            return other.id == self.id and other.results == self.results
-        return NotImplemented
-
-    def __repr__(self):
-        return "<%s: %s %r>" % (self.__class__.__name__, self.id,
-                                [r.id for r in self.results])
-
-    def serializable(self):
-        return self.id, [r.serializable() for r in self.results]
+        return (self.__class__, (self.taskset_id, self.results))
 
     @classmethod
     def restore(self, taskset_id, backend=None):
         """Restore previously saved taskset result."""
         return (backend or current_app.backend).restore_taskset(taskset_id)
 
-    def _get_taskset_id(self):
-        return self.id
-
-    def _set_taskset_id(self, id):
-        self.id = id
-    taskset_id = property(_get_taskset_id, _set_taskset_id)
-
 
 class EagerResult(AsyncResult):
     """Result that we know has already been executed."""
 
-    def __init__(self, id, ret_value, state, traceback=None):
-        self.id = id
+    def __init__(self, task_id, ret_value, state, traceback=None):
+        self.task_id = task_id
         self._result = ret_value
         self._state = state
         self._traceback = traceback
 
     def __reduce__(self):
-        return self.__class__, self.__reduce_args__()
-
-    def __reduce_args__(self):
-        return (self.id, self._result, self._state, self._traceback)
+        return (self.__class__, (self.task_id, self._result,
+                                 self._state, self._traceback))
 
     def __copy__(self):
         cls, args = self.__reduce__()
@@ -674,7 +523,7 @@ class EagerResult(AsyncResult):
         self._state = states.REVOKED
 
     def __repr__(self):
-        return "<EagerResult: %s>" % self.id
+        return "<EagerResult: %s>" % self.task_id
 
     @property
     def result(self):

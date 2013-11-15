@@ -12,58 +12,89 @@
 from __future__ import absolute_import
 from __future__ import with_statement
 
+import os
 import warnings
+import platform as _platform
 
-from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import wraps
 
-from billiard.util import register_after_fork
 from kombu.clocks import LamportClock
-from kombu.utils import cached_property
 
-from celery import platforms
-from celery.exceptions import AlwaysEagerIgnored
-from celery.loaders import get_loader_cls
-from celery.local import PromiseProxy, maybe_evaluate
-from celery.state import _task_stack, _tls, get_current_app
-from celery.utils.functional import first
-from celery.utils.imports import instantiate, symbol_by_name
+from .. import datastructures
+from .. import platforms
+from ..exceptions import AlwaysEagerIgnored
+from ..utils import cached_property, instantiate, lpmerge
 
-from .annotations import prepare as prepare_annotations
-from .builtins import shared_task, load_shared_tasks
-from .defaults import DEFAULTS, find_deprecated_settings
-from .registry import TaskRegistry
-from .utils import AppPickler, Settings, bugreport, _unpickle_app
+from .defaults import DEFAULTS, find_deprecated_settings, find
 
+import kombu
+if kombu.VERSION < (2, 0):
+    raise ImportError("Celery requires Kombu version 1.1.0 or higher.")
 
-def _unpickle_appattr(reverse_name, args):
-    """Given an attribute name and a list of args, gets
-    the attribute from the current app and calls it."""
-    return get_current_app()._rgetattr(reverse_name)(*args)
+BUGREPORT_INFO = """
+platform -> system:%(system)s arch:%(arch)s imp:%(py_i)s
+software -> celery:%(celery_v)s kombu:%(kombu_v)s py:%(py_v)s
+settings -> transport:%(transport)s results:%(results)s
+"""
 
 
-class Celery(object):
-    Pickler = AppPickler
+class Settings(datastructures.ConfigurationView):
 
+    @property
+    def CELERY_RESULT_BACKEND(self):
+        """Resolves deprecated alias ``CELERY_BACKEND``."""
+        return self.get("CELERY_RESULT_BACKEND") or self.get("CELERY_BACKEND")
+
+    @property
+    def BROKER_TRANSPORT(self):
+        """Resolves compat aliases :setting:`BROKER_BACKEND`
+        and :setting:`CARROT_BACKEND`."""
+        return (self.get("BROKER_TRANSPORT") or
+                self.get("BROKER_BACKEND") or
+                self.get("CARROT_BACKEND"))
+
+    @property
+    def BROKER_BACKEND(self):
+        """Deprecated compat alias to :attr:`BROKER_TRANSPORT`."""
+        return self.BROKER_TRANSPORT
+
+    @property
+    def BROKER_HOST(self):
+        return (os.environ.get("CELERY_BROKER_URL") or
+                self.get("BROKER_URL") or
+                self.get("BROKER_HOST"))
+
+    def find_option(self, name, namespace="celery"):
+        return find(name, namespace)
+
+    def get_by_parts(self, *parts):
+        return self["_".join(filter(None, parts))]
+
+    def find_value_for_key(self, name, namespace="celery"):
+        ns, key, _ = self.find_option(name, namespace=namespace)
+        return self.get_by_parts(ns, key)
+
+
+class BaseApp(object):
+    """Base class for apps."""
     SYSTEM = platforms.SYSTEM
-    IS_OSX, IS_WINDOWS = platforms.IS_OSX, platforms.IS_WINDOWS
+    IS_OSX = platforms.IS_OSX
+    IS_WINDOWS = platforms.IS_WINDOWS
 
     amqp_cls = "celery.app.amqp:AMQP"
     backend_cls = None
     events_cls = "celery.events:Events"
     loader_cls = "celery.loaders.app:AppLoader"
-    log_cls = "celery.app.log:Logging"
-    control_cls = "celery.app.control:Control"
-    registry_cls = TaskRegistry
+    log_cls = "celery.log:Logging"
+    control_cls = "celery.task.control:Control"
+
     _pool = None
 
     def __init__(self, main=None, loader=None, backend=None,
             amqp=None, events=None, log=None, control=None,
-            set_as_current=True, accept_magic_kwargs=False,
-            tasks=None, broker=None, include=None, **kwargs):
-        self.clock = LamportClock()
+            set_as_current=True, accept_magic_kwargs=False, **kwargs):
         self.main = main
         self.amqp_cls = amqp or self.amqp_cls
         self.backend_cls = backend or self.backend_cls
@@ -72,129 +103,121 @@ class Celery(object):
         self.log_cls = log or self.log_cls
         self.control_cls = control or self.control_cls
         self.set_as_current = set_as_current
-        self.registry_cls = symbol_by_name(self.registry_cls)
         self.accept_magic_kwargs = accept_magic_kwargs
+        self.clock = LamportClock()
 
-        self.finalized = False
-        self._pending = deque()
-        self._tasks = tasks
-        if not isinstance(self._tasks, TaskRegistry):
-            self._tasks = TaskRegistry(self._tasks or {})
-
-        # these options are moved to the config to
-        # simplify pickling of the app object.
-        self._preconf = {}
-        if broker:
-            self._preconf["BROKER_URL"] = broker
-        if include:
-            self._preconf["CELERY_IMPORTS"] = include
-
-        if self.set_as_current:
-            self.set_current()
         self.on_init()
 
-    def set_current(self):
-        _tls.current_app = self
-
     def on_init(self):
-        """Optional callback called at init."""
+        """Called at the end of the constructor."""
         pass
 
-    def start(self, argv=None):
-        return instantiate("celery.bin.celery:CeleryCommand", app=self) \
-                    .execute_from_commandline(argv)
-
-    def worker_main(self, argv=None):
-        return instantiate("celery.bin.celeryd:WorkerCommand", app=self) \
-                    .execute_from_commandline(argv)
-
-    def task(self, *args, **opts):
-        """Creates new task class from any callable."""
-
-        def inner_create_task_cls(shared=True, filter=None, **opts):
-
-            def _create_task_cls(fun):
-                if shared:
-                    cons = lambda app: app._task_from_fun(fun, **opts)
-                    cons.__name__ = fun.__name__
-                    shared_task(cons)
-                if self.accept_magic_kwargs:  # compat mode
-                    task = self._task_from_fun(fun, **opts)
-                    if filter:
-                        task = filter(task)
-                    return task
-
-                # return a proxy object that is only evaluated when first used
-                promise = PromiseProxy(self._task_from_fun, (fun, ), opts)
-                self._pending.append(promise)
-                if filter:
-                    return filter(promise)
-                return promise
-
-            return _create_task_cls
-
-        if len(args) == 1 and callable(args[0]):
-            return inner_create_task_cls(**opts)(*args)
-        return inner_create_task_cls(**opts)
-
-    def _task_from_fun(self, fun, **options):
-        base = options.pop("base", None) or self.Task
-
-        T = type(fun.__name__, (base, ), dict({
-                "app": self,
-                "accept_magic_kwargs": False,
-                "run": staticmethod(fun),
-                "__doc__": fun.__doc__,
-                "__module__": fun.__module__}, **options))()
-        task = self._tasks[T.name]  # return global instance.
-        task.bind(self)
-        return task
-
-    def finalize(self):
-        if not self.finalized:
-            self.finalized = True
-            load_shared_tasks(self)
-
-            pending = self._pending
-            while pending:
-                maybe_evaluate(pending.pop())
-
-            for task in self._tasks.itervalues():
-                task.bind(self)
-
     def config_from_object(self, obj, silent=False):
+        """Read configuration from object, where object is either
+        a object, or the name of a module to import.
+
+            >>> celery.config_from_object("myapp.celeryconfig")
+
+            >>> from myapp import celeryconfig
+            >>> celery.config_from_object(celeryconfig)
+
+        """
         del(self.conf)
         return self.loader.config_from_object(obj, silent=silent)
 
     def config_from_envvar(self, variable_name, silent=False):
+        """Read configuration from environment variable.
+
+        The value of the environment variable must be the name
+        of a module to import.
+
+            >>> os.environ["CELERY_CONFIG_MODULE"] = "myapp.celeryconfig"
+            >>> celery.config_from_envvar("CELERY_CONFIG_MODULE")
+
+        """
         del(self.conf)
         return self.loader.config_from_envvar(variable_name, silent=silent)
 
     def config_from_cmdline(self, argv, namespace="celery"):
+        """Read configuration from argv.
+
+        The config
+
+        """
         self.conf.update(self.loader.cmdline_config_parser(argv, namespace))
 
     def send_task(self, name, args=None, kwargs=None, countdown=None,
             eta=None, task_id=None, publisher=None, connection=None,
-            result_cls=None, expires=None, queues=None, **options):
-        if self.conf.CELERY_ALWAYS_EAGER:  # pragma: no cover
+            connect_timeout=None, result_cls=None, expires=None,
+            queues=None, **options):
+        """Send task by name.
+
+        :param name: Name of task to execute (e.g. `"tasks.add"`).
+        :keyword result_cls: Specify custom result class. Default is
+            using :meth:`AsyncResult`.
+
+        Supports the same arguments as
+        :meth:`~celery.app.task.BaseTask.apply_async`.
+
+        """
+        if self.conf.CELERY_ALWAYS_EAGER:
             warnings.warn(AlwaysEagerIgnored(
                 "CELERY_ALWAYS_EAGER has no effect on send_task"))
 
-        result_cls = result_cls or self.AsyncResult
         router = self.amqp.Router(queues)
+        result_cls = result_cls or self.AsyncResult
+
         options.setdefault("compression",
                            self.conf.CELERY_MESSAGE_COMPRESSION)
         options = router.route(options, name, args, kwargs)
-        with self.default_producer(publisher) as producer:
-            return result_cls(producer.delay_task(name, args, kwargs,
-                                                  task_id=task_id,
-                                                  countdown=countdown, eta=eta,
-                                                  expires=expires, **options))
+        exchange = options.get("exchange")
+        exchange_type = options.get("exchange_type")
+
+        with self.default_connection(connection, connect_timeout) as conn:
+            publish = publisher or self.amqp.TaskPublisher(conn,
+                                            exchange=exchange,
+                                            exchange_type=exchange_type)
+            try:
+                new_id = publish.delay_task(name, args, kwargs,
+                                            task_id=task_id,
+                                            countdown=countdown, eta=eta,
+                                            expires=expires, **options)
+            finally:
+                publisher or publish.close()
+            return result_cls(new_id)
+
+    def AsyncResult(self, task_id, backend=None, task_name=None):
+        """Create :class:`celery.result.BaseAsyncResult` instance."""
+        from ..result import BaseAsyncResult
+        return BaseAsyncResult(task_id, app=self, task_name=task_name,
+                               backend=backend or self.backend)
+
+    def TaskSetResult(self, taskset_id, results, **kwargs):
+        """Create :class:`celery.result.TaskSetResult` instance."""
+        from ..result import TaskSetResult
+        return TaskSetResult(taskset_id, results, app=self)
 
     def broker_connection(self, hostname=None, userid=None,
             password=None, virtual_host=None, port=None, ssl=None,
             insist=None, connect_timeout=None, transport=None,
             transport_options=None, **kwargs):
+        """Establish a connection to the message broker.
+
+        :keyword hostname: defaults to the :setting:`BROKER_HOST` setting.
+        :keyword userid: defaults to the :setting:`BROKER_USER` setting.
+        :keyword password: defaults to the :setting:`BROKER_PASSWORD` setting.
+        :keyword virtual_host: defaults to the :setting:`BROKER_VHOST` setting.
+        :keyword port: defaults to the :setting:`BROKER_PORT` setting.
+        :keyword ssl: defaults to the :setting:`BROKER_USE_SSL` setting.
+        :keyword insist: defaults to the :setting:`BROKER_INSIST` setting.
+        :keyword connect_timeout: defaults to the
+            :setting:`BROKER_CONNECTION_TIMEOUT` setting.
+        :keyword backend_cls: defaults to the :setting:`BROKER_TRANSPORT`
+            setting.
+
+        :returns :class:`kombu.connection.BrokerConnection`:
+
+        """
         conf = self.conf
         return self.amqp.BrokerConnection(
                     hostname or conf.BROKER_HOST,
@@ -211,24 +234,24 @@ class Celery(object):
                                            **transport_options or {}))
 
     @contextmanager
-    def default_connection(self, connection=None, *args, **kwargs):
+    def default_connection(self, connection=None, connect_timeout=None):
+        """For use within a with-statement to get a connection from the pool
+        if one is not already provided.
+
+        :keyword connection: If not provided, then a connection will be
+                             acquired from the connection pool.
+        :keyword connect_timeout: *No longer used.*
+
+        """
         if connection:
             yield connection
         else:
             with self.pool.acquire(block=True) as connection:
                 yield connection
 
-    @contextmanager
-    def default_producer(self, producer=None):
-        if producer:
-            yield producer
-        else:
-            with self.amqp.producer_pool.acquire(block=True) as producer:
-                yield producer
-
     def with_default_connection(self, fun):
-        """With any function accepting a `connection`
-        keyword argument, establishes a default connection if one is
+        """With any function accepting `connection` and `connect_timeout`
+        keyword arguments, establishes a default connection if one is
         not already passed to it.
 
         Any automatically established connection will be closed after
@@ -248,12 +271,14 @@ class Celery(object):
 
     def prepare_config(self, c):
         """Prepare configuration before it is merged with the defaults."""
-        return find_deprecated_settings(c)
+        find_deprecated_settings(c)
+        return c
 
     def now(self):
         return self.loader.now(utc=self.conf.CELERY_ENABLE_UTC)
 
     def mail_admins(self, subject, body, fail_silently=False):
+        """Send an email to the admins in the :setting:`ADMINS` setting."""
         if self.conf.ADMINS:
             to = [admin_email for _, admin_email in self.conf.ADMINS]
             return self.loader.mail_admins(subject, body, fail_silently, to=to,
@@ -267,133 +292,61 @@ class Celery(object):
                                        use_tls=self.conf.EMAIL_USE_TLS)
 
     def select_queues(self, queues=None):
-        return self.amqp.queues.select_subset(queues)
+        if queues:
+            return self.amqp.queues.select_subset(queues,
+                                    self.conf.CELERY_CREATE_MISSING_QUEUES)
 
     def either(self, default_key, *values):
         """Fallback to the value of a configuration key if none of the
         `*values` are true."""
-        return first(None, values) or self.conf.get(default_key)
+        for value in values:
+            if value is not None:
+                return value
+        return self.conf.get(default_key)
 
-    def bugreport(self):
-        return bugreport(self)
+    def merge(self, l, r):
+        """Like `dict(a, **b)` except it will keep values from `a`
+        if the value in `b` is :const:`None`."""
+        return lpmerge(l, r)
 
     def _get_backend(self):
-        from celery.backends import get_backend_by_url
-        backend, url = get_backend_by_url(
-                self.backend_cls or self.conf.CELERY_RESULT_BACKEND,
-                self.loader)
-        return backend(app=self, url=url)
+        from ..backends import get_backend_cls
+        return get_backend_cls(
+                    self.backend_cls or self.conf.CELERY_RESULT_BACKEND,
+                    loader=self.loader)(app=self)
 
     def _get_config(self):
-        s = Settings({}, [self.prepare_config(self.loader.conf),
+        return Settings({}, [self.prepare_config(self.loader.conf),
                              deepcopy(DEFAULTS)])
-        if self._preconf:
-            for key, value in self._preconf.iteritems():
-                setattr(s, key, value)
-        return s
 
     def _after_fork(self, obj_):
         if self._pool:
             self._pool.force_close_all()
             self._pool = None
 
-    def create_task_cls(self):
-        """Creates a base task class using default configuration
-        taken from this app."""
-        return self.subclass_with_self("celery.app.task:Task", name="Task",
-                                       attribute="_app", abstract=True)
-
-    def subclass_with_self(self, Class, name=None, attribute="app",
-            reverse=None, **kw):
-        """Subclass an app-compatible class by setting its app attribute
-        to be this app instance.
-
-        App-compatible means that the class has a class attribute that
-        provides the default app it should use, e.g.
-        ``class Foo: app = None``.
-
-        :param Class: The app-compatible class to subclass.
-        :keyword name: Custom name for the target class.
-        :keyword attribute: Name of the attribute holding the app,
-                            default is "app".
-
-        """
-        Class = symbol_by_name(Class)
-        reverse = reverse if reverse else Class.__name__
-
-        def __reduce__(self):
-            return _unpickle_appattr, (reverse, self.__reduce_args__())
-
-        attrs = dict({attribute: self}, __module__=Class.__module__,
-                     __doc__=Class.__doc__, __reduce__=__reduce__, **kw)
-
-        return type(name or Class.__name__, (Class, ), attrs)
-
-    def _rgetattr(self, path):
-        return reduce(getattr, [self] + path.split('.'))
-
-    def __repr__(self):
-        return "<%s %s:0x%x>" % (self.__class__.__name__,
-                                 self.main or "__main__", id(self), )
-
-    def __reduce__(self):
-        # Reduce only pickles the configuration changes,
-        # so the default configuration doesn't have to be passed
-        # between processes.
-        return (_unpickle_app, (self.__class__, self.Pickler)
-                              + self.__reduce_args__())
-
-    def __reduce_args__(self):
-        return (self.main, self.conf.changes, self.loader_cls,
-                self.backend_cls, self.amqp_cls, self.events_cls,
-                self.log_cls, self.control_cls, self.accept_magic_kwargs)
-
-    @cached_property
-    def Worker(self):
-        """Create new :class:`~celery.apps.worker.Worker` instance."""
-        return self.subclass_with_self("celery.apps.worker:Worker")
-
-    @cached_property
-    def WorkController(self, **kwargs):
-        return self.subclass_with_self("celery.worker:WorkController")
-
-    @cached_property
-    def Beat(self, **kwargs):
-        """Create new :class:`~celery.apps.beat.Beat` instance."""
-        return self.subclass_with_self("celery.apps.beat:Beat")
-
-    @cached_property
-    def TaskSet(self):
-        return self.subclass_with_self("celery.task.sets:TaskSet")
-
-    @cached_property
-    def Task(self):
-        """Default Task base class for this application."""
-        return self.create_task_cls()
-
-    @cached_property
-    def annotations(self):
-        return prepare_annotations(self.conf.CELERY_ANNOTATIONS)
-
-    @cached_property
-    def AsyncResult(self):
-        return self.subclass_with_self("celery.result:AsyncResult")
-
-    @cached_property
-    def TaskSetResult(self):
-        return self.subclass_with_self("celery.result:TaskSetResult")
+    def bugreport(self):
+        import celery
+        import kombu
+        return BUGREPORT_INFO % {"system": _platform.system(),
+                                 "arch": _platform.architecture(),
+                                 "py_i": platforms.pyimplementation(),
+                                 "celery_v": celery.__version__,
+                                 "kombu_v": kombu.__version__,
+                                 "py_v": _platform.python_version(),
+                                 "transport": self.conf.BROKER_TRANSPORT,
+                                 "results": self.conf.CELERY_RESULT_BACKEND}
 
     @property
     def pool(self):
         if self._pool is None:
-            register_after_fork(self, self._after_fork)
+            try:
+                from multiprocessing.util import register_after_fork
+                register_after_fork(self, self._after_fork)
+            except ImportError:
+                pass
             self._pool = self.broker_connection().Pool(
                             limit=self.conf.BROKER_POOL_LIMIT)
         return self._pool
-
-    @property
-    def current_task(self):
-        return _task_stack.top
 
     @cached_property
     def amqp(self):
@@ -414,7 +367,7 @@ class Celery(object):
     @cached_property
     def control(self):
         """Controlling worker nodes.  See
-        :class:`~celery.app.control.Control`."""
+        :class:`~celery.task.control.Control`."""
         return instantiate(self.control_cls, app=self)
 
     @cached_property
@@ -425,20 +378,15 @@ class Celery(object):
     @cached_property
     def loader(self):
         """Current loader."""
+        from ..loaders import get_loader_cls
         return get_loader_cls(self.loader_cls)(app=self)
 
     @cached_property
     def log(self):
-        """Logging utilities.  See :class:`~celery.app.log.Logging`."""
+        """Logging utilities.  See :class:`~celery.log.Logging`."""
         return instantiate(self.log_cls, app=self)
 
     @cached_property
     def tasks(self):
-        """Registry of available tasks.
-
-        Accessing this attribute will also finalize the app.
-
-        """
-        self.finalize()
-        return self._tasks
-App = Celery  # compat
+        from ..registry import tasks
+        return tasks

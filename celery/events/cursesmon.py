@@ -22,10 +22,10 @@ from itertools import count
 from textwrap import wrap
 from math import ceil
 
-from celery import __version__
-from celery import states
-from celery.app import app_or_default
-from celery.utils.text import abbr, abbrtask
+from .. import __version__
+from .. import states
+from ..app import app_or_default
+from ..utils import abbr, abbrtask
 
 BORDER_SPACING = 4
 LEFT_BORDER_OFFSET = 3
@@ -35,11 +35,8 @@ TIMESTAMP_WIDTH = 8
 MIN_WORKER_WIDTH = 15
 MIN_TASK_WIDTH = 16
 
-# this module is considered experimental
-# we don't care about coverage.
 
-
-class CursesMonitor(object):  # pragma: no cover
+class CursesMonitor(object):
     keymap = {}
     win = None
     screen_width = None
@@ -223,7 +220,7 @@ class CursesMonitor(object):  # pragma: no cover
         curses.echo()
         try:
             i = 0
-            while 1:
+            while True:
                 ch = self.win.getch(x, y + i)
                 if ch != -1:
                     if ch in (10, curses.KEY_ENTER):            # enter
@@ -462,7 +459,7 @@ class CursesMonitor(object):  # pragma: no cover
                         if w.alive]
 
 
-class DisplayThread(threading.Thread):  # pragma: no cover
+class DisplayThread(threading.Thread):
 
     def __init__(self, display):
         self.display = display
@@ -475,7 +472,7 @@ class DisplayThread(threading.Thread):  # pragma: no cover
             self.display.nap()
 
 
-def capture_events(app, state, display):  # pragma: no cover
+def capture_events(app, state, display):
 
     def on_connection_error(exc, interval):
         sys.stderr.write("Connection Error: %r. Retry in %ss." % (
@@ -496,7 +493,7 @@ def capture_events(app, state, display):  # pragma: no cover
                 sys.stderr.write("Connection lost: %r" % (exc, ))
 
 
-def evtop(app=None):  # pragma: no cover
+def evtop(app=None):
     app = app_or_default(app)
     state = app.events.State()
     display = CursesMonitor(state, app=app)
@@ -516,5 +513,5 @@ def evtop(app=None):  # pragma: no cover
         display.resetscreen()
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     evtop()

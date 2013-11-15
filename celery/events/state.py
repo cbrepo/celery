@@ -22,20 +22,19 @@
 from __future__ import absolute_import
 from __future__ import with_statement
 
+import time
 import heapq
 
 from threading import Lock
-from time import time
 
-from kombu.utils import kwdict
+from .. import states
+from ..datastructures import AttributeDict, LRUCache
+from ..utils import kwdict
 
-from celery import states
-from celery.datastructures import AttributeDict, LRUCache
-
-# The window (in percentage) is added to the workers heartbeat
-# frequency.  If the time between updates exceeds this window,
-# then the worker is considered to be offline.
-HEARTBEAT_EXPIRE_WINDOW = 200
+#: Hartbeat expiry time in seconds.  The worker will be considered offline
+#: if no heartbeat is received within this time.
+#: Default is 2:30 minutes.
+HEARTBEAT_EXPIRE = 150
 
 
 class Element(AttributeDict):
@@ -45,26 +44,21 @@ class Element(AttributeDict):
 class Worker(Element):
     """Worker State."""
     heartbeat_max = 4
-    expire_window = HEARTBEAT_EXPIRE_WINDOW
 
     def __init__(self, **fields):
-        fields.setdefault("freq", 60)
         super(Worker, self).__init__(**fields)
         self.heartbeats = []
 
     def on_online(self, timestamp=None, **kwargs):
         """Callback for the `worker-online` event."""
-        self.update(**kwargs)
         self._heartpush(timestamp)
 
     def on_offline(self, **kwargs):
         """Callback for the `worker-offline` event."""
-        self.update(**kwargs)
         self.heartbeats = []
 
     def on_heartbeat(self, timestamp=None, **kwargs):
         """Callback for the `worker-heartbeat` event."""
-        self.update(**kwargs)
         self._heartpush(timestamp)
 
     def _heartpush(self, timestamp):
@@ -78,12 +72,9 @@ class Worker(Element):
                                      self.alive and "ONLINE" or "OFFLINE")
 
     @property
-    def heartbeat_expires(self):
-        return self.heartbeats[-1] + self.freq * (self.expire_window / 1e2)
-
-    @property
     def alive(self):
-        return (self.heartbeats and time() < self.heartbeat_expires)
+        return (self.heartbeats and
+                time.time() < self.heartbeats[-1] + HEARTBEAT_EXPIRE)
 
 
 class Task(Element):
@@ -299,7 +290,7 @@ class State(object):
     def itertasks(self, limit=None):
         for index, row in enumerate(self.tasks.iteritems()):
             yield row
-            if limit and index + 1 >= limit:
+            if limit and index >= limit:
                 break
 
     def tasks_by_timestamp(self, limit=None):

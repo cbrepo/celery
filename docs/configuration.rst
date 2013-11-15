@@ -23,15 +23,22 @@ It should contain all you need to run a basic Celery set-up.
 
 .. code-block:: python
 
-    ## Broker settings.
-    BROKER_URL = "amqp://guest:guest@localhost:5672//"
-
     # List of modules to import when celery starts.
     CELERY_IMPORTS = ("myapp.tasks", )
 
-    ## Using the database to store task state and results.
+    ## Result store settings.
     CELERY_RESULT_BACKEND = "database"
     CELERY_RESULT_DBURI = "sqlite:///mydatabase.db"
+
+    ## Broker settings.
+    BROKER_URL = "amqp://guest:guest@localhost:5672//"
+
+    ## Worker settings
+    ## If you're doing mostly I/O you can have more processes,
+    ## but if mostly spending CPU, try to keep it close to the
+    ## number of CPUs on your machine. If not set, the number of CPUs/cores
+    ## available will be used.
+    CELERYD_CONCURRENCY = 10
 
     CELERY_ANNOTATIONS = {"tasks.add": {"rate_limit": "10/s"}}
 
@@ -138,11 +145,6 @@ CELERYD_CONCURRENCY
 The number of concurrent worker processes/threads/green threads, executing
 tasks.
 
-If you're doing mostly I/O you can have more processes,
-but if mostly CPU-bound, try to keep it close to the
-number of CPUs on your machine. If not set, the number of CPUs/cores
-on the host will be used.
-
 Defaults to the number of available CPUs.
 
 .. setting:: CELERYD_PREFETCH_MULTIPLIER
@@ -189,6 +191,10 @@ Can be one of the following:
     Use `Redis`_ to store the results.
     See :ref:`conf-redis-result-backend`.
 
+* tyrant
+    Use `Tokyo Tyrant`_ to store the results.
+    See :ref:`conf-tyrant-result-backend`.
+
 * amqp
     Send results back as AMQP messages
     See :ref:`conf-amqp-result-backend`.
@@ -206,6 +212,7 @@ Can be one of the following:
 .. _`memcached`: http://memcached.org
 .. _`MongoDB`: http://mongodb.org
 .. _`Redis`: http://code.google.com/p/redis/
+.. _`Tokyo Tyrant`: http://1978th.net/tokyotyrant/
 .. _`Cassandra`: http://cassandra.apache.org/
 
 .. setting:: CELERY_RESULT_SERIALIZER
@@ -376,6 +383,42 @@ setting:
                                     "behaviors": {"tcp_nodelay": True}}
 
 .. _`pylibmc`: http://sendapatch.se/projects/pylibmc/
+
+.. _conf-tyrant-result-backend:
+
+Tokyo Tyrant backend settings
+-----------------------------
+
+.. note::
+
+    The Tokyo Tyrant backend requires the :mod:`pytyrant` library:
+    http://pypi.python.org/pypi/pytyrant/
+
+This backend requires the following configuration directives to be set:
+
+.. setting:: TT_HOST
+
+TT_HOST
+~~~~~~~
+
+Host name of the Tokyo Tyrant server.
+
+.. setting:: TT_PORT
+
+TT_PORT
+~~~~~~~
+
+The port the Tokyo Tyrant server is listening to.
+
+
+Example configuration
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    CELERY_RESULT_BACKEND = "tyrant"
+    TT_HOST = "localhost"
+    TT_PORT = 1978
 
 .. _conf-redis-result-backend:
 
@@ -610,16 +653,8 @@ If enabled (default), any queues specified that is not defined in
 CELERY_DEFAULT_QUEUE
 ~~~~~~~~~~~~~~~~~~~~
 
-The name of the default queue used by `.apply_async` if the message has
-no route or no custom queue has been specified.
-
-
-This queue must be listed in :setting:`CELERY_QUEUES`.
-If :setting:`CELERY_QUEUES` is not specified then it this automatically
-created containing one queue entry, where this name is used as the name of
-that queue.
-
-The default is: `celery`.
+The queue used by default, if no custom queue is specified.  This queue must
+be listed in :setting:`CELERY_QUEUES`.  The default is: `celery`.
 
 .. seealso::
 
@@ -631,17 +666,14 @@ CELERY_DEFAULT_EXCHANGE
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 Name of the default exchange to use when no custom exchange is
-specified for a key in the :setting:`CELERY_QUEUES` setting.
-
-The default is: `celery`.
+specified.  The default is: `celery`.
 
 .. setting:: CELERY_DEFAULT_EXCHANGE_TYPE
 
 CELERY_DEFAULT_EXCHANGE_TYPE
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Default exchange type used when no custom exchange type is specified.
-for a key in the :setting:`CELERY_QUEUES` setting.
+Default exchange type used when no custom exchange is specified.
 The default is: `direct`.
 
 .. setting:: CELERY_DEFAULT_ROUTING_KEY
@@ -649,9 +681,7 @@ The default is: `direct`.
 CELERY_DEFAULT_ROUTING_KEY
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The default routing key used when no custom routing key
-is specified for a key in the :setting:`CELERY_QUEUES` setting.
-
+The default routing key used when sending tasks.
 The default is: `celery`.
 
 .. setting:: CELERY_DEFAULT_DELIVERY_MODE
@@ -674,6 +704,12 @@ BROKER_TRANSPORT
 :Aliases: ``BROKER_BACKEND``
 :Deprecated aliases: ``CARROT_BACKEND``
 
+The Kombu transport to use.  Default is ``amqplib``.
+
+You can use a custom transport class name, or select one of the
+built-in transports: ``amqplib``, ``pika``, ``redis``, ``beanstalk``,
+``sqlalchemy``, ``django``, ``mongodb``, ``couchdb``.
+
 .. setting:: BROKER_URL
 
 BROKER_URL
@@ -686,13 +722,48 @@ Default broker URL.  This must be an URL in the form of::
 Only the scheme part (``transport://``) is required, the rest
 is optional, and defaults to the specific transports default values.
 
-The transport part is the broker implementation to use, and the
-default is ``amqp``, but there are many other choices including
-``librabbitmq``, ``amqplib``, ``redis``, ``beanstalk``,
-``sqlalchemy``, ``django``, ``mongodb``, ``couchdb`` and ``pika``.
-It can also be a fully qualified path to your own transport implementation.
+If this setting is defined it will override a subset of the
+other ``BROKER`` options. These options are :setting:`BROKER_HOST`,
+:setting:`BROKER_USER`, :setting:`BROKER_PASSWORD`, :setting:`BROKER_PORT`,
+and :setting:`BROKER_VHOST`.
 
 See the Kombu documentation for more information about broker URLs.
+
+.. setting:: BROKER_HOST
+
+BROKER_HOST
+~~~~~~~~~~~
+
+Hostname of the broker.
+
+.. setting:: BROKER_PORT
+
+BROKER_PORT
+~~~~~~~~~~~
+
+Custom port of the broker.  Default is to use the default port for the
+selected backend.
+
+.. setting:: BROKER_USER
+
+BROKER_USER
+~~~~~~~~~~~
+
+Username to connect as.
+
+.. setting:: BROKER_PASSWORD
+
+BROKER_PASSWORD
+~~~~~~~~~~~~~~~
+
+Password to connect with.
+
+.. setting:: BROKER_VHOST
+
+BROKER_VHOST
+~~~~~~~~~~~~
+
+Virtual host.  Default is `"/"`.
 
 .. setting:: BROKER_USE_SSL
 
@@ -977,14 +1048,6 @@ A sequence of modules to import when the celery daemon starts.
 This is used to specify the task modules to import, but also
 to import signal handlers and additional remote control commands, etc.
 
-.. setting:: CELERY_INCLUDE
-
-CELERY_INCLUDE
-~~~~~~~~~~~~~~
-
-Exact same semantics as :setting:`CELERY_IMPORTS`, but can be used as a means
-to have different import categories.
-
 .. setting:: CELERYD_FORCE_EXECV
 
 CELERYD_FORCE_EXECV
@@ -1002,18 +1065,6 @@ especially in combination with time limits or having a max tasks per child limit
 This option will be enabled by default in a later version.
 
 This is not a problem on Windows, as it does not have `fork()`.
-
-.. setting:: CELERYD_WORKER_LOST_WAIT
-
-CELERYD_WORKER_LOST_WAIT
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-In some cases a worker may be killed without proper cleanup,
-and the worker may have published a result before terminating.
-This value specifies how long we wait for any missing results before
-raising a :exc:`@WorkerLostError` exception.
-
-Default is 10.0
 
 .. setting:: CELERYD_MAX_TASKS_PER_CHILD
 
@@ -1038,7 +1089,7 @@ CELERYD_TASK_SOFT_TIME_LIMIT
 
 Task soft time limit in seconds.
 
-The :exc:`~@SoftTimeLimitExceeded` exception will be
+The :exc:`~celery.exceptions.SoftTimeLimitExceeded` exception will be
 raised when this is exceeded.  The task can catch this to
 e.g. clean up before the hard time limit comes.
 
@@ -1046,9 +1097,10 @@ Example:
 
 .. code-block:: python
 
+    from celery.task import task
     from celery.exceptions import SoftTimeLimitExceeded
 
-    @celery.task
+    @task()
     def mytask():
         try:
             return do_work()
@@ -1077,10 +1129,10 @@ Can also be set via the :option:`--statedb` argument to
 
 Not enabled by default.
 
-.. setting:: CELERYD_TIMER_PRECISION
+.. setting:: CELERYD_ETA_SCHEDULER_PRECISION
 
-CELERYD_TIMER_PRECISION
-~~~~~~~~~~~~~~~~~~~~~~~
+CELERYD_ETA_SCHEDULER_PRECISION
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Set the maximum time in seconds that the ETA scheduler can sleep between
 rechecking the schedule.  Default is 1 second.
@@ -1449,9 +1501,9 @@ CELERYD_MEDIATOR
 Name of the mediator class used by the worker.
 Default is :class:`celery.worker.controllers.Mediator`.
 
-.. setting:: CELERYD_TIMER
+.. setting:: CELERYD_ETA_SCHEDULER
 
-CELERYD_TIMER
+CELERYD_ETA_SCHEDULER
 ~~~~~~~~~~~~~~~~~~~~~
 
 Name of the ETA scheduler class used by the worker.
@@ -1500,18 +1552,7 @@ CELERYBEAT_MAX_LOOP_INTERVAL
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The maximum number of seconds :mod:`~celery.bin.celerybeat` can sleep
-between checking the schedule.
-
-
-The default for this value is scheduler specific.
-For the default celerybeat scheduler the value is 300 (5 minutes),
-but for e.g. the django-celery database scheduler it is 5 seconds
-because the schedule may be changed externally, and so it must take
-changes to the schedule into account.
-
-Also when running celerybeat embedded (:option:`-B`) on Jython as a thread
-the max interval is overridden and set to 1 so that it's possible
-to shut down in a timely manner.
+between checking the schedule.  Default is 300 seconds (5 minutes).
 
 
 .. _conf-celerymon:

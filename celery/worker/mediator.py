@@ -22,13 +22,9 @@ import logging
 
 from Queue import Empty
 
-from celery.app import app_or_default
-from celery.utils.threads import bgThread
-from celery.utils.log import get_logger
-
-from .abstract import StartStopComponent
-
-logger = get_logger(__name__)
+from ..abstract import StartStopComponent
+from ..app import app_or_default
+from ..utils.threads import bgThread
 
 
 class WorkerComponent(StartStopComponent):
@@ -39,11 +35,12 @@ class WorkerComponent(StartStopComponent):
         w.mediator = None
 
     def include_if(self, w):
-        return w.start_mediator
+        return not w.disable_rate_limits or w.pool_cls.requires_mediator
 
     def create(self, w):
         m = w.mediator = self.instantiate(w.mediator_cls, w.ready_queue,
-                                          app=w.app, callback=w.process_task)
+                                          app=w.app, callback=w.process_task,
+                                          logger=w.logger)
         return m
 
 
@@ -55,11 +52,12 @@ class Mediator(bgThread):
     #: Callback called when a task is obtained.
     callback = None
 
-    def __init__(self, ready_queue, callback, app=None, **kw):
+    def __init__(self, ready_queue, callback, logger=None, app=None):
         self.app = app_or_default(app)
+        self.logger = logger or self.app.log.get_default_logger()
         self.ready_queue = ready_queue
         self.callback = callback
-        self._does_debug = logger.isEnabledFor(logging.DEBUG)
+        self._does_debug = self.logger.isEnabledFor(logging.DEBUG)
         super(Mediator, self).__init__()
 
     def body(self):
@@ -72,14 +70,16 @@ class Mediator(bgThread):
             return
 
         if self._does_debug:
-            logger.debug("Mediator: Running callback for task: %s[%s]",
-                         task.name, task.id)
+            self.logger.debug(
+                "Mediator: Running callback for task: %s[%s]" % (
+                    task.task_name, task.task_id))
 
         try:
             self.callback(task)
         except Exception, exc:
-            logger.error("Mediator callback raised exception %r",
-                         exc, exc_info=True,
-                         extra={"data": {"id": task.id,
-                                         "name": task.name,
-                                         "hostname": task.hostname}})
+            self.logger.error("Mediator callback raised exception %r",
+                              exc, exc_info=True,
+                              extra={"data": {"id": task.task_id,
+                                              "name": task.task_name,
+                                              "hostname": task.hostname}})
+    move = body   # XXX compat

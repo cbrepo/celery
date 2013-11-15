@@ -9,30 +9,6 @@ if sys.version_info < (2, 5):
     raise Exception("Celery requires Python 2.5 or higher.")
 
 try:
-    orig_path = sys.path[:]
-    for path in (os.path.curdir, os.getcwd()):
-        if path in sys.path:
-            sys.path.remove(path)
-    try:
-        import celery.app
-        import imp
-        import shutil
-        _, task_path, _ = imp.find_module("task", celery.app.__path__)
-        if task_path.endswith("/task"):
-            print("- force upgrading previous installation")
-            print("  - removing %r package..." % task_path)
-            try:
-                shutil.rmtree(os.path.abspath(task_path))
-            except Exception:
-                sys.stderr.write("Couldn't remove %r: %r\n" % (
-                    task_path, sys.exc_info[1]))
-    finally:
-        sys.path[:] = orig_path
-except ImportError:
-    pass
-
-
-try:
     from setuptools import setup, find_packages
     from setuptools.command.test import test
 except ImportError:
@@ -63,6 +39,8 @@ classes = """
     Programming Language :: Python :: 2.5
     Programming Language :: Python :: 2.6
     Programming Language :: Python :: 2.7
+    Programming Language :: Python :: 3
+    Programming Language :: Python :: 3.2
     Programming Language :: Python :: Implementation :: CPython
     Programming Language :: Python :: Implementation :: PyPy
     Programming Language :: Python :: Implementation :: Jython
@@ -127,27 +105,36 @@ class quicktest(test):
         test.run(self, *args, **kwargs)
 
 # -*- Installation Dependencies -*-
+
+install_requires = []
+try:
+    import importlib  # noqa
+except ImportError:
+    install_requires.append("importlib")
+install_requires.extend([
+    "anyjson>=0.3.1",
+    "kombu>=2.1.5,<3.0",
+])
+if is_py3k:
+    install_requires.append("python-dateutil>=2.0")
+else:
+    install_requires.append("python-dateutil>=1.5,<2.0")
+
 py_version = sys.version_info
 is_jython = sys.platform.startswith("java")
 is_pypy = hasattr(sys, "pypy_version_info")
-
-
-def reqs(f):
-    return filter(None, [l.strip() for l in open(
-        os.path.join(os.getcwd(), "requirements", f)).readlines()])
-
-install_requires = reqs("default-py3k.txt" if is_py3k else "default.txt")
+if sys.version_info < (2, 7):
+    install_requires.append("ordereddict") # Replacement for the ordered dict
+if sys.version_info < (2, 6) and not (is_jython or is_pypy):
+    install_requires.append("multiprocessing")
 
 if is_jython:
-    install_requires.extend(reqs("jython.txt"))
-if py_version[0:2] == (2, 6):
-    install_requires.extend(reqs("py26.txt"))
-elif py_version[0:2] == (2, 5):
-    install_requires.extend(reqs("py25.txt"))
+    install_requires.append("threadpool")
+    install_requires.append("simplejson")
 
 # -*- Tests Requires -*-
 
-tests_require = ["nose", "nose-cover3", "sqlalchemy", "mock==dev"]
+tests_require = ["nose", "nose-cover3", "sqlalchemy", "mock", "cl"]
 if sys.version_info < (2, 7):
     tests_require.append("unittest2")
 elif sys.version_info <= (2, 5):
@@ -163,7 +150,6 @@ else:
 # -*- Entry Points -*- #
 
 console_scripts = entrypoints["console_scripts"] = [
-        'celery = celery.bin.celery:main',
         'celeryd = celery.bin.celeryd:main',
         'celerybeat = celery.bin.celerybeat:main',
         'camqadm = celery.bin.camqadm:main',
@@ -178,7 +164,7 @@ entrypoints["bundle.bundles"] = ["celery = celery.contrib.bundles:bundles"]
 # -*- %%% -*-
 
 setup(
-    name=NAME,
+    name="celery",
     version=meta["VERSION"],
     description=meta["doc"],
     author=meta["author"],

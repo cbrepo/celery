@@ -14,14 +14,16 @@ from __future__ import with_statement
 
 import sys
 import time
+import traceback
 
 from collections import defaultdict
 from itertools import chain
+from threading import RLock
 
-from billiard.einfo import ExceptionInfo  # noqa
 from kombu.utils.limits import TokenBucket  # noqa
 
-from .utils.functional import LRUCache, first, uniq  # noqa
+from .utils import uniq
+from .utils.compat import UserDict, OrderedDict
 
 
 class CycleError(Exception):
@@ -50,7 +52,7 @@ class DependencyGraph(object):
 
     def add_arc(self, obj):
         """Add an object to the graph."""
-        self.adjacent.setdefault(obj, [])
+        self.adjacent[obj] = []
 
     def add_edge(self, A, B):
         """Add an edge from object ``A`` to object ``B``
@@ -82,10 +84,7 @@ class DependencyGraph(object):
 
     def valency_of(self, obj):
         """Returns the velency (degree) of a vertex in the graph."""
-        try:
-            l = [len(self[obj])]
-        except KeyError:
-            return 0
+        l = [len(self[obj])]
         for node in self[obj]:
             l.append(self.valency_of(node))
         return sum(l)
@@ -184,9 +183,6 @@ class DependencyGraph(object):
     def __len__(self):
         return len(self.adjacent)
 
-    def __contains__(self, obj):
-        return obj in self.adjacent
-
     def _iterate_items(self):
         return self.adjacent.iteritems()
     items = iteritems = _iterate_items
@@ -196,11 +192,10 @@ class DependencyGraph(object):
 
     def repr_node(self, obj, level=1):
         output = ["%s(%s)" % (obj, self.valency_of(obj))]
-        if obj in self:
-            for other in self[obj]:
-                d = "%s(%s)" % (other, self.valency_of(other))
-                output.append('     ' * level + d)
-                output.extend(self.repr_node(other, level + 1).split('\n')[1:])
+        for other in self[obj]:
+            d = "%s(%s)" % (other, self.valency_of(other))
+            output.append('     ' * level + d)
+            output.extend(self.repr_node(other, level + 1).split('\n')[1:])
         return '\n'.join(output)
 
 
@@ -211,13 +206,13 @@ class AttributeDictMixin(object):
 
     """
 
-    def __getattr__(self, k):
+    def __getattr__(self, key):
         """`d.key -> d[key]`"""
         try:
-            return self[k]
+            return self[key]
         except KeyError:
-            raise AttributeError(
-                "'%s' object has no attribute '%s'" % (type(self).__name__, k))
+            raise AttributeError("'%s' object has no attribute '%s'" % (
+                    self.__class__.__name__, key))
 
     def __setattr__(self, key, value):
         """`d[key] = value -> d.key = value`"""
@@ -264,24 +259,13 @@ class DictAttribute(object):
     def __contains__(self, key):
         return hasattr(self.obj, key)
 
-    def _iterate_keys(self):
-        return vars(self.obj).iterkeys()
-    iterkeys = _iterate_keys
-
-    def __iter__(self):
-        return self.iterkeys()
-
     def _iterate_items(self):
         return vars(self.obj).iteritems()
     iteritems = _iterate_items
 
-    if sys.version_info[0] == 3:  # pragma: no cover
+    if sys.version_info >= (3, 0):  # pragma: no cover
         items = _iterate_items
-        keys = _iterate_keys
     else:
-
-        def keys(self):
-            return list(self._iterate_keys())
 
         def items(self):
             return list(self._iterate_items())
@@ -315,9 +299,6 @@ class ConfigurationView(AttributeDictMixin):
 
     def __setitem__(self, key, value):
         self.changes[key] = value
-
-    def first(self, *keys):
-        return first(None, (self.get(key) for key in keys))
 
     def get(self, key, default=None):
         try:
@@ -374,6 +355,109 @@ class ConfigurationView(AttributeDictMixin):
         return list(self._iterate_values())
 
 
+class _Code(object):
+
+    def __init__(self, code):
+        self.co_filename = code.co_filename
+        self.co_name = code.co_name
+
+
+class _Frame(object):
+    Code = _Code
+
+    def __init__(self, frame):
+        self.f_globals = {
+            "__file__": frame.f_globals.get("__file__", "__main__"),
+            "__name__": frame.f_globals.get("__name__"),
+            "__loader__": frame.f_globals.get("__loader__"),
+        }
+        self.f_locals = fl = {}
+        try:
+            fl["__traceback_hide__"] = frame.f_locals["__traceback_hide__"]
+        except KeyError:
+            pass
+        self.f_code = self.Code(frame.f_code)
+        self.f_lineno = frame.f_lineno
+
+
+class _Object(object):
+
+    def __init__(self, **kw):
+        [setattr(self, k, v) for k, v in kw.iteritems()]
+
+
+class _Truncated(object):
+
+    def __init__(self):
+        self.tb_lineno = -1
+        self.tb_frame = _Object(
+                f_globals={"__file__": "",
+                           "__name__": "",
+                           "__loader__": None},
+                f_fileno=None,
+                f_code=_Object(co_filename="...",
+                               co_name="[rest of traceback truncated]"),
+        )
+        self.tb_next = None
+
+
+class Traceback(object):
+    Frame = _Frame
+
+    tb_frame = tb_lineno = tb_next = None
+    max_frames = sys.getrecursionlimit() / 8
+
+    def __init__(self, tb, max_frames=None, depth=0):
+        limit = self.max_frames = max_frames or self.max_frames
+        self.tb_frame = self.Frame(tb.tb_frame)
+        self.tb_lineno = tb.tb_lineno
+        if tb.tb_next is not None:
+            if depth <= limit:
+                self.tb_next = Traceback(tb.tb_next, limit, depth + 1)
+            else:
+                self.tb_next = _Truncated()
+
+
+class ExceptionInfo(object):
+    """Exception wrapping an exception and its traceback.
+
+    :param exc_info: The exception info tuple as returned by
+        :func:`sys.exc_info`.
+
+    """
+
+    #: Exception type.
+    type = None
+
+    #: Exception instance.
+    exception = None
+
+    #: Pickleable traceback instance for use with :mod:`traceback`
+    tb = None
+
+    #: String representation of the traceback.
+    traceback = None
+
+    #: Set to true if this is an internal error.
+    internal = False
+
+    def __init__(self, exc_info, internal=False):
+        self.type, self.exception, tb = exc_info
+        self.tb = Traceback(tb)
+        self.traceback = ''.join(traceback.format_exception(*exc_info))
+        self.internal = internal
+
+    def __str__(self):
+        return self.traceback
+
+    def __repr__(self):
+        return "<ExceptionInfo: %r>" % (self.exception, )
+
+    @property
+    def exc_info(self):
+        return self.type, self.exception, self.tb
+
+
 class LimitedSet(object):
     """Kind-of Set with limitations.
 
@@ -386,13 +470,12 @@ class LimitedSet(object):
     :keyword expires: Time in seconds, before a membership expires.
 
     """
-    __slots__ = ("maxlen", "expires", "_data", "__len__")
+    __slots__ = ("maxlen", "expires", "_data")
 
     def __init__(self, maxlen=None, expires=None):
         self.maxlen = maxlen
         self.expires = expires
         self._data = {}
-        self.__len__ = self._data.__len__
 
     def add(self, value):
         """Add a new member."""
@@ -433,10 +516,13 @@ class LimitedSet(object):
         return self._data
 
     def __iter__(self):
-        return iter(self._data)
+        return iter(self._data.keys())
+
+    def __len__(self):
+        return len(self._data.keys())
 
     def __repr__(self):
-        return "LimitedSet(%r)" % (self._data.keys(), )
+        return "LimitedSet([%s])" % (repr(self._data.keys()))
 
     @property
     def chronologically(self):
@@ -446,3 +532,68 @@ class LimitedSet(object):
     def first(self):
         """Get the oldest member."""
         return self.chronologically[0]
+
+
+class LRUCache(UserDict):
+    """LRU Cache implementation using a doubly linked list to track access.
+
+    :keyword limit: The maximum number of keys to keep in the cache.
+        When a new key is inserted and the limit has been exceeded,
+        the *Least Recently Used* key will be discarded from the
+        cache.
+
+    """
+
+    def __init__(self, limit=None):
+        self.limit = limit
+        self.mutex = RLock()
+        self.data = OrderedDict()
+
+    def __getitem__(self, key):
+        with self.mutex:
+            value = self[key] = self.data.pop(key)
+        return value
+
+    def keys(self):
+        # userdict.keys in py3k calls __getitem__
+        return self.data.keys()
+
+    def values(self):
+        return list(self._iterate_values())
+
+    def items(self):
+        return list(self._iterate_items())
+
+    def __setitem__(self, key, value):
+        # remove least recently used key.
+        with self.mutex:
+            if self.limit and len(self.data) >= self.limit:
+                self.data.pop(iter(self.data).next())
+            self.data[key] = value
+
+    def __iter__(self):
+        return self.data.iterkeys()
+
+    def _iterate_items(self):
+        for k in self:
+            try:
+                yield (k, self.data[k])
+            except KeyError:
+                pass
+    iteritems = _iterate_items
+
+    def _iterate_values(self):
+        for k in self:
+            try:
+                yield self.data[k]
+            except KeyError:  # pragma: no cover
+                pass
+    itervalues = _iterate_values
+
+    def incr(self, key, delta=1):
+        with self.mutex:
+            # this acts as memcached does- store as a string, but return a
+            # integer as long as it exists and we can cast it
+            newval = int(self.data.pop(key)) + delta
+            self[key] = str(newval)
+        return newval

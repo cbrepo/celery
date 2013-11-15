@@ -8,19 +8,15 @@ import sys
 from datetime import timedelta
 
 from kombu import serialization
-from kombu.utils.encoding import bytes_to_str, ensure_bytes, from_utf8
 
-from celery import states
-from celery.app import current_task
-from celery.datastructures import LRUCache
-from celery.exceptions import TimeoutError, TaskRevokedError
-from celery.result import from_serializable
-from celery.utils import timeutils
-from celery.utils.serialization import (
-        get_pickled_exception,
-        get_pickleable_exception,
-        create_exception_cls,
-)
+from .. import states
+from ..datastructures import LRUCache
+from ..exceptions import TimeoutError, TaskRevokedError
+from ..utils import timeutils
+from ..utils.encoding import bytes_to_str, ensure_bytes, from_utf8
+from ..utils.serialization import (get_pickled_exception,
+                                   get_pickleable_exception,
+                                   create_exception_cls)
 
 EXCEPTION_ABLE_CODECS = frozenset(["pickle", "yaml"])
 is_py3k = sys.version_info >= (3, 0)
@@ -48,7 +44,7 @@ class BaseBackend(object):
     supports_native_join = False
 
     def __init__(self, *args, **kwargs):
-        from celery.app import app_or_default
+        from ..app import app_or_default
         self.app = app_or_default(kwargs.get("app"))
         self.serializer = kwargs.get("serializer",
                                      self.app.conf.CELERY_RESULT_SERIALIZER)
@@ -120,7 +116,7 @@ class BaseBackend(object):
         if self.serializer in EXCEPTION_ABLE_CODECS:
             return get_pickled_exception(exc)
         return create_exception_cls(from_utf8(exc["exc_type"]),
-                                    sys.modules[__name__])(exc["exc_message"])
+                                    sys.modules[__name__])
 
     def prepare_value(self, result):
         """Prepare value for storage."""
@@ -144,7 +140,7 @@ class BaseBackend(object):
 
         time_elapsed = 0.0
 
-        while 1:
+        while True:
             status = self.get_status(task_id)
             if status == states.SUCCESS:
                 return self.get_result(task_id)
@@ -178,10 +174,6 @@ class BaseBackend(object):
         raise NotImplementedError(
                 "get_result is not supported by this backend.")
 
-    def get_children(self, task_id):
-        raise NotImplementedError(
-                "get_children is not supported by this backend.")
-
     def get_traceback(self, task_id):
         """Get the traceback for a failed task."""
         raise NotImplementedError(
@@ -214,16 +206,11 @@ class BaseBackend(object):
     def on_chord_part_return(self, task, propagate=False):
         pass
 
-    def fallback_chord_unlock(self, setid, body, result=None, **kwargs):
-        kwargs["result"] = [r.id for r in result]
-        self.app.tasks["celery.chord_unlock"].apply_async((setid, body, ),
-                                                          kwargs, countdown=1)
-    on_chord_apply = fallback_chord_unlock
-
-    def current_task_children(self):
-        current = current_task()
-        if current:
-            return [r.serializable() for r in current.request.children]
+    def on_chord_apply(self, setid, body, result=None, **kwargs):
+        from ..registry import tasks
+        kwargs["result"] = [r.task_id for r in result]
+        tasks["celery.chord_unlock"].apply_async((setid, body, ), kwargs,
+                                                 countdown=1)
 
     def __reduce__(self, args=(), kwargs={}):
         return (unpickle_backend, (self.__class__, args, kwargs))
@@ -264,13 +251,6 @@ class BaseDictBackend(BaseBackend):
             return self.exception_to_python(meta["result"])
         else:
             return meta["result"]
-
-    def get_children(self, task_id):
-        """Get the list of subtasks sent by a task."""
-        try:
-            return self.get_task_meta(task_id)["children"]
-        except KeyError:
-            pass
 
     def get_task_meta(self, task_id, cache=True):
         if cache:
@@ -322,7 +302,6 @@ class KeyValueStoreBackend(BaseDictBackend):
     task_keyprefix = ensure_bytes("celery-task-meta-")
     taskset_keyprefix = ensure_bytes("celery-taskset-meta-")
     chord_keyprefix = ensure_bytes("chord-unlock-")
-    implements_incr = False
 
     def get(self, key):
         raise NotImplementedError("Must implement the get method.")
@@ -335,12 +314,6 @@ class KeyValueStoreBackend(BaseDictBackend):
 
     def delete(self, key):
         raise NotImplementedError("Must implement the delete method")
-
-    def incr(self, key):
-        raise NotImplementedError("Does not implement incr")
-
-    def expire(self, key, value):
-        pass
 
     def get_key_for_task(self, task_id):
         """Get the cache key for a task by id."""
@@ -356,7 +329,6 @@ class KeyValueStoreBackend(BaseDictBackend):
 
     def _strip_prefix(self, key):
         """Takes bytes, emits string."""
-        key = ensure_bytes(key)
         for prefix in self.task_keyprefix, self.taskset_keyprefix:
             if key.startswith(prefix):
                 return bytes_to_str(key[len(prefix):])
@@ -406,14 +378,13 @@ class KeyValueStoreBackend(BaseDictBackend):
         self.delete(self.get_key_for_task(task_id))
 
     def _store_result(self, task_id, result, status, traceback=None):
-        meta = {"status": status, "result": result, "traceback": traceback,
-                "children": self.current_task_children()}
+        meta = {"status": status, "result": result, "traceback": traceback}
         self.set(self.get_key_for_task(task_id), self.encode(meta))
         return result
 
     def _save_taskset(self, taskset_id, result):
         self.set(self.get_key_for_taskset(taskset_id),
-                 self.encode({"result": result.serializable()}))
+                 self.encode({"result": result}))
         return result
 
     def _delete_taskset(self, taskset_id):
@@ -429,39 +400,8 @@ class KeyValueStoreBackend(BaseDictBackend):
     def _restore_taskset(self, taskset_id):
         """Get task metadata for a task by id."""
         meta = self.get(self.get_key_for_taskset(taskset_id))
-        # previously this was always pickled, but later this
-        # was extended to support other serializers, so the
-        # structure is kind of weird.
         if meta:
-            meta = self.decode(meta)
-            result = meta["result"]
-            if isinstance(result, (list, tuple)):
-                return {"result": from_serializable(result)}
-            return meta
-
-    def on_chord_apply(self, setid, body, result=None, **kwargs):
-        if self.implements_incr:
-            self.app.TaskSetResult(setid, result).save()
-        else:
-            self.fallback_chord_unlock(setid, body, result, **kwargs)
-
-    def on_chord_part_return(self, task, propagate=False):
-        if not self.implements_incr:
-            return
-        from celery import subtask
-        from celery.result import TaskSetResult
-        setid = task.request.taskset
-        if not setid:
-            return
-        key = self.get_key_for_chord(setid)
-        deps = TaskSetResult.restore(setid, backend=task.backend)
-        val = self.incr(key)
-        if val >= deps.total:
-            subtask(task.request.chord).delay(deps.join(propagate=propagate))
-            deps.delete()
-            self.client.delete(key)
-        else:
-            self.expire(key, 86400)
+            return self.decode(meta)
 
 
 class DisabledBackend(BaseBackend):

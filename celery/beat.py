@@ -16,28 +16,25 @@ import os
 import time
 import shelve
 import sys
+import threading
 import traceback
+try:
+    import multiprocessing
+except ImportError:
+    multiprocessing = None  # noqa
 
-from billiard import Process, ensure_multiprocessing
 from kombu.utils import reprcall
-from kombu.utils.functional import maybe_promise
 
 from . import __version__
 from . import platforms
+from . import registry
 from . import signals
 from . import current_app
 from .app import app_or_default
+from .log import SilenceRepeated
 from .schedules import maybe_schedule, crontab
-from .utils import cached_property
-from .utils.imports import instantiate
-from .utils.threads import Event, Thread
+from .utils import cached_property, instantiate, maybe_promise
 from .utils.timeutils import humanize_seconds
-from .utils.log import get_logger
-
-logger = get_logger(__name__)
-debug, info, error = logger.debug, logger.info, logger.error
-
-DEFAULT_MAX_INTERVAL = 300  # 5 minutes
 
 
 class SchedulingError(Exception):
@@ -114,7 +111,7 @@ class ScheduleEntry(object):
                               "options": other.options})
 
     def is_due(self):
-        """See :meth:`~celery.schedule.schedule.is_due`."""
+        """See :meth:`celery.task.base.PeriodicTask.is_due`."""
         return self.schedule.is_due(self.last_run_at)
 
     def __iter__(self):
@@ -130,6 +127,7 @@ class Scheduler(object):
     """Scheduler for periodic tasks.
 
     :keyword schedule: see :attr:`schedule`.
+    :keyword logger: see :attr:`logger`.
     :keyword max_interval: see :attr:`max_interval`.
 
     """
@@ -139,24 +137,25 @@ class Scheduler(object):
     #: The schedule dict/shelve.
     schedule = None
 
+    #: Current logger.
+    logger = None
+
     #: Maximum time to sleep between re-checking the schedule.
-    max_interval = DEFAULT_MAX_INTERVAL
+    max_interval = 1
 
     #: How often to sync the schedule (3 minutes by default)
     sync_every = 3 * 60
 
     _last_sync = None
 
-    logger = logger  # compat
-
-    def __init__(self, schedule=None, max_interval=None,
+    def __init__(self, schedule=None, logger=None, max_interval=None,
             app=None, Publisher=None, lazy=False, **kwargs):
         app = self.app = app_or_default(app)
         self.data = maybe_promise({} if schedule is None else schedule)
-        self.max_interval = (max_interval
-                                or app.conf.CELERYBEAT_MAX_LOOP_INTERVAL
-                                or self.max_interval)
-        self.Publisher = Publisher or app.amqp.TaskProducer
+        self.logger = logger or app.log.get_default_logger(name="celery.beat")
+        self.max_interval = max_interval or \
+                                app.conf.CELERYBEAT_MAX_LOOP_INTERVAL
+        self.Publisher = Publisher or app.amqp.TaskPublisher
         if not lazy:
             self.setup_schedule()
 
@@ -174,14 +173,16 @@ class Scheduler(object):
         is_due, next_time_to_run = entry.is_due()
 
         if is_due:
-            info("Scheduler: Sending due task %s", entry.task)
+            self.logger.info("Scheduler: Sending due task %s", entry.task)
             try:
                 result = self.apply_async(entry, publisher=publisher)
             except Exception, exc:
-                error("Message Error: %s\n%s",
-                      exc, traceback.format_stack(), exc_info=True)
+                self.logger.error("Message Error: %s\n%s", exc,
+                                  traceback.format_stack(),
+                                  exc_info=True)
             else:
-                debug("%s sent. id->%s", entry.task, result.id)
+                self.logger.debug("%s sent. id->%s", entry.task,
+                                                     result.task_id)
         return next_time_to_run
 
     def tick(self):
@@ -214,7 +215,7 @@ class Scheduler(object):
         # so we have that done if an exception is raised (doesn't schedule
         # forever.)
         entry = self.reserve(entry)
-        task = self.app.tasks.get(entry.task)
+        task = registry.tasks.get(entry.task)
 
         try:
             if task:
@@ -229,12 +230,12 @@ class Scheduler(object):
             raise SchedulingError, SchedulingError(
                 "Couldn't apply scheduled task %s: %s" % (
                     entry.name, exc)), sys.exc_info()[2]
-        finally:
-            if self.should_sync():
-                self._do_sync()
+
+        if self.should_sync():
+            self._do_sync()
         return result
 
-    def send_task(self, *args, **kwargs):
+    def send_task(self, *args, **kwargs):               # pragma: no cover
         return self.app.send_task(*args, **kwargs)
 
     def setup_schedule(self):
@@ -242,7 +243,7 @@ class Scheduler(object):
 
     def _do_sync(self):
         try:
-            debug("Celerybeat: Synchronizing schedule...")
+            self.logger.debug("Celerybeat: Synchronizing schedule...")
             self.sync()
         finally:
             self._last_sync = time.time()
@@ -283,22 +284,21 @@ class Scheduler(object):
             else:
                 schedule[key] = entry
 
-    def _ensure_connected(self):
-        # callback called for each retry while the connection
-        # can't be established.
-        def _error_handler(exc, interval):
-            error("Celerybeat: Connection error: %s. "
-                  "Trying again in %s seconds...", exc, interval)
-
-        return self.connection.ensure_connection(_error_handler,
-                    self.app.conf.BROKER_CONNECTION_MAX_RETRIES)
-
     def get_schedule(self):
         return self.data
 
     def set_schedule(self, schedule):
         self.data = schedule
-    schedule = property(get_schedule, set_schedule)
+
+    def _ensure_connected(self):
+        # callback called for each retry while the connection
+        # can't be established.
+        def _error_handler(exc, interval):
+            self.logger.error("Celerybeat: Connection error: %s. "
+                              "Trying again in %s seconds...", exc, interval)
+
+        return self.connection.ensure_connection(_error_handler,
+                    self.app.conf.BROKER_CONNECTION_MAX_RETRIES)
 
     @cached_property
     def connection(self):
@@ -306,7 +306,11 @@ class Scheduler(object):
 
     @cached_property
     def publisher(self):
-        return self.Publisher(self._ensure_connected())
+        return self.Publisher(connection=self._ensure_connected())
+
+    @property
+    def schedule(self):
+        return self.get_schedule()
 
     @property
     def info(self):
@@ -315,7 +319,6 @@ class Scheduler(object):
 
 class PersistentScheduler(Scheduler):
     persistence = shelve
-    known_suffixes = ("", ".db", ".dat", ".bak", ".dir")
 
     _store = None
 
@@ -324,7 +327,7 @@ class PersistentScheduler(Scheduler):
         Scheduler.__init__(self, *args, **kwargs)
 
     def _remove_db(self):
-        for suffix in self.known_suffixes:
+        for suffix in "", ".db", ".dat", ".bak", ".dir":
             try:
                 os.remove(self.schedule_filename + suffix)
             except OSError, exc:
@@ -337,8 +340,8 @@ class PersistentScheduler(Scheduler):
                                                 writeback=True)
             entries = self._store.setdefault("entries", {})
         except Exception, exc:
-            error("Removing corrupted schedule file %r: %r",
-                  self.schedule_filename, exc, exc_info=True)
+            self.logger.error("Removing corrupted schedule file %r: %r",
+                              self.schedule_filename, exc, exc_info=True)
             self._remove_db()
             self._store = self.persistence.open(self.schedule_filename,
                                                 writeback=True)
@@ -350,15 +353,12 @@ class PersistentScheduler(Scheduler):
         self.install_default_entries(self.schedule)
         self._store["__version__"] = __version__
         self.sync()
-        debug("Current schedule:\n" + "\n".join(repr(entry)
+        self.logger.debug("Current schedule:\n" +
+                          "\n".join(repr(entry)
                                     for entry in entries.itervalues()))
 
     def get_schedule(self):
         return self._store["entries"]
-
-    def set_schedule(self, schedule):
-        self._store["entries"] = schedule
-    schedule = property(get_schedule, set_schedule)
 
     def sync(self):
         if self._store is not None:
@@ -376,22 +376,25 @@ class PersistentScheduler(Scheduler):
 class Service(object):
     scheduler_cls = PersistentScheduler
 
-    def __init__(self, max_interval=None, schedule_filename=None,
+    def __init__(self, logger=None, max_interval=None, schedule_filename=None,
             scheduler_cls=None, app=None):
         app = self.app = app_or_default(app)
-        self.max_interval = (max_interval
-                             or app.conf.CELERYBEAT_MAX_LOOP_INTERVAL)
+        self.max_interval = max_interval or \
+                                app.conf.CELERYBEAT_MAX_LOOP_INTERVAL
         self.scheduler_cls = scheduler_cls or self.scheduler_cls
+        self.logger = logger or app.log.get_default_logger(name="celery.beat")
         self.schedule_filename = schedule_filename or \
                                     app.conf.CELERYBEAT_SCHEDULE_FILENAME
 
-        self._is_shutdown = Event()
-        self._is_stopped = Event()
+        self._is_shutdown = threading.Event()
+        self._is_stopped = threading.Event()
+        self.debug = SilenceRepeated(self.logger.debug,
+                        10 if self.max_interval < 60 else 1)
 
     def start(self, embedded_process=False):
-        info("Celerybeat: Starting...")
-        debug("Celerybeat: Ticking with max interval->%s",
-              humanize_seconds(self.scheduler.max_interval))
+        self.logger.info("Celerybeat: Starting...")
+        self.logger.debug("Celerybeat: Ticking with max interval->%s",
+                          humanize_seconds(self.scheduler.max_interval))
 
         signals.beat_init.send(sender=self)
         if embedded_process:
@@ -399,10 +402,10 @@ class Service(object):
             platforms.set_process_title("celerybeat")
 
         try:
-            while not self._is_shutdown.is_set():
+            while not self._is_shutdown.isSet():
                 interval = self.scheduler.tick()
-                debug("Celerybeat: Waking up %s.",
-                      humanize_seconds(interval, prefix="in "))
+                self.debug("Celerybeat: Waking up %s.",
+                           humanize_seconds(interval, prefix="in "))
                 time.sleep(interval)
         except (KeyboardInterrupt, SystemExit):
             self._is_shutdown.set()
@@ -414,7 +417,7 @@ class Service(object):
         self._is_stopped.set()
 
     def stop(self, wait=False):
-        info("Celerybeat: Shutting down...")
+        self.logger.info("Celerybeat: Shutting down...")
         self._is_shutdown.set()
         wait and self._is_stopped.wait()  # block until shutdown done.
 
@@ -423,6 +426,7 @@ class Service(object):
         scheduler = instantiate(self.scheduler_cls,
                                 app=self.app,
                                 schedule_filename=filename,
+                                logger=self.logger,
                                 max_interval=self.max_interval,
                                 lazy=lazy)
         return scheduler
@@ -432,14 +436,14 @@ class Service(object):
         return self.get_scheduler()
 
 
-class _Threaded(Thread):
+class _Threaded(threading.Thread):
     """Embedded task scheduler using threading."""
 
     def __init__(self, *args, **kwargs):
         super(_Threaded, self).__init__()
         self.service = Service(*args, **kwargs)
-        self.daemon = True
-        self.name = "Beat"
+        self.setDaemon(True)
+        self.setName("Beat")
 
     def run(self):
         self.service.start()
@@ -448,12 +452,10 @@ class _Threaded(Thread):
         self.service.stop(wait=True)
 
 
-try:
-    ensure_multiprocessing()
-except NotImplementedError:     # pragma: no cover
-    _Process = None
-else:
-    class _Process(Process):    # noqa
+if multiprocessing is not None:
+
+    class _Process(multiprocessing.Process):
+        """Embedded task scheduler using multiprocessing."""
 
         def __init__(self, *args, **kwargs):
             super(_Process, self).__init__()
@@ -467,6 +469,8 @@ else:
         def stop(self):
             self.service.stop()
             self.terminate()
+else:
+    _Process = None
 
 
 def EmbeddedService(*args, **kwargs):
@@ -481,4 +485,5 @@ def EmbeddedService(*args, **kwargs):
         # in reasonable time.
         kwargs.setdefault("max_interval", 1)
         return _Threaded(*args, **kwargs)
+
     return _Process(*args, **kwargs)

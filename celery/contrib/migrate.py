@@ -67,14 +67,14 @@ def migrate_tasks(source, dest, timeout=1.0, app=None,
     def update_state(body, message):
         state.count += 1
 
-    producer = app.amqp.TaskProducer(dest)
+    producer = app.amqp.TaskPublisher(dest)
     if migrate is None:
         migrate = partial(migrate_task, producer)
-    consumer = app.amqp.TaskConsumer(source)
-    consumer.register_callback(update_state)
     if callback is not None:
         callback = partial(callback, state)
-        consumer.register_callback(callback)
+    consumer = app.amqp.get_task_consumer(source)
+    consumer.register_callback(update_state)
+    consumer.register_callback(callback)
     consumer.register_callback(migrate)
 
     # declare all queues on the new broker.
@@ -90,7 +90,7 @@ def migrate_tasks(source, dest, timeout=1.0, app=None,
     # start migrating messages.
     with consumer:
         try:
-            for _ in eventloop(source, timeout=timeout):  # pragma: no cover
+            for _ in eventloop(source, timeout=timeout):
                 pass
         except socket.timeout:
             return

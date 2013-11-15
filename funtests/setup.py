@@ -52,6 +52,7 @@ setup(
         "unittest2>=0.4.0",
         "simplejson",
         "nose",
+        "pytyrant",
         "redis",
         "pymongo",
     ],

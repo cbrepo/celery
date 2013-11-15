@@ -20,7 +20,6 @@ Contents:
     community
     tutorials/index
     faq
-    whatsnew-2.6
     whatsnew-2.5
     changelog
     reference/index

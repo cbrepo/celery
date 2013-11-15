@@ -17,7 +17,13 @@
 
         .. attribute:: Consumer
 
-            Base Consumer class used.  Default is :class:`kombu.compat.Consumer`.
+            The task consumer class used.
+            Default is :class:`kombu.compat.Consumer`.
+
+        .. attribute:: ConsumerSet
+
+            The class used to consume from multiple queues using the
+            same channel.
 
         .. attribute:: queues
 
@@ -25,15 +31,11 @@
 
         .. automethod:: Queues
         .. automethod:: Router
-        .. autoattribute:: TaskConsumer
-        .. autoattribute:: TaskProducer
-        .. automethod:: flush_routes
+        .. automethod:: TaskConsumer
+        .. automethod:: TaskPublisher
 
-        .. autoattribute:: default_queue
-        .. autoattribute:: default_exchange
-        .. autoattribute:: publisher_pool
-        .. autoattribute:: router
-        .. autoattribute:: routes
+        .. automethod:: get_task_consumer
+        .. automethod:: get_default_queue
 
     Queues
     ------
@@ -42,13 +44,13 @@
 
         .. automethod:: add
 
+        .. automethod:: options
+
         .. automethod:: format
 
         .. automethod:: select_subset
 
-        .. automethod:: new_missing
-
-        .. autoattribute:: consume_from
+        .. automethod:: with_defaults
 
     TaskPublisher
     -------------

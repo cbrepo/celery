@@ -46,12 +46,8 @@ from itertools import count
 from Queue import Empty, Queue
 
 from celery.task import Task
-from celery.utils import timer2
-from celery.utils.log import get_logger
+from celery.utils import cached_property, timer2
 from celery.worker import state
-
-
-logger = get_logger(__name__)
 
 
 def consume_queue(queue):
@@ -79,14 +75,14 @@ def consume_queue(queue):
 
 
 def apply_batches_task(task, args, loglevel, logfile):
-    task.push_request(loglevel=loglevel, logfile=logfile)
+    task.request.update({"loglevel": loglevel, "logfile": logfile})
     try:
         result = task(*args)
-    except Exception, exc:
+    except Exception, exp:
         result = None
-        task.logger.error("Error: %r", exc, exc_info=True)
+        task.logger.error("There was an Exception: %s", exp, exc_info=True)
     finally:
-        task.pop_request()
+        task.request.clear()
     return result
 
 
@@ -121,7 +117,7 @@ class SimpleRequest(object):
 
     @classmethod
     def from_request(cls, request):
-        return cls(request.id, request.name, request.args,
+        return cls(request.task_id, request.task_name, request.args,
                    request.kwargs, request.delivery_info, request.hostname)
 
 
@@ -165,15 +161,15 @@ class Batches(Task):
             self._do_flush()
 
     def _do_flush(self):
-        logger.debug("Batches: Wake-up to flush buffer...")
+        self.debug("Wake-up to flush buffer...")
         requests = None
         if self._buffer.qsize():
             requests = list(consume_queue(self._buffer))
             if requests:
-                logger.debug("Batches: Buffer complete: %s", len(requests))
+                self.debug("Buffer complete: %s", len(requests))
                 self.flush(requests)
         if not requests:
-            logger.debug("Batches: Cancelling timer: Nothing in buffer.")
+            self.debug("Cancelling timer: Nothing in buffer.")
             self._tref.cancel()  # cancel timer.
             self._tref = None
 
@@ -193,3 +189,10 @@ class Batches(Task):
                     (self, args, loglevel, logfile),
                     accept_callback=on_accepted,
                     callback=acks_late[True] and on_return or None)
+
+    def debug(self, msg):
+        self.logger.debug("%s: %s", self.name, msg)
+
+    @cached_property
+    def logger(self):
+        return self.app.log.get_default_logger()

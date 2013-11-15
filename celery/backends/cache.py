@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 
-from celery.datastructures import LRUCache
-from celery.exceptions import ImproperlyConfigured
-from celery.utils import cached_property
+from ..datastructures import LRUCache
+from ..exceptions import ImproperlyConfigured
+from ..utils import cached_property
 
 from .base import KeyValueStoreBackend
 
@@ -67,7 +67,6 @@ backends = {"memcache": lambda: get_best_memcache,
 class CacheBackend(KeyValueStoreBackend):
     servers = None
     supports_native_join = True
-    implements_incr = True
 
     def __init__(self, expires=None, backend=None, options={}, **kwargs):
         super(CacheBackend, self).__init__(self, **kwargs)
@@ -101,10 +100,21 @@ class CacheBackend(KeyValueStoreBackend):
         return self.client.delete(key)
 
     def on_chord_apply(self, setid, body, result=None, **kwargs):
-        self.client.set(self.get_key_for_chord(setid), '0', time=86400)
+        key = self.get_key_for_chord(setid)
+        self.client.set(key, '0', time=86400)
 
-    def incr(self, key):
-        return self.client.incr(key)
+    def on_chord_part_return(self, task, propagate=False):
+        from ..task.sets import subtask
+        from ..result import TaskSetResult
+        setid = task.request.taskset
+        if not setid:
+            return
+        key = self.get_key_for_chord(setid)
+        deps = TaskSetResult.restore(setid, backend=task.backend)
+        if self.client.incr(key) >= deps.total:
+            subtask(task.request.chord).delay(deps.join(propagate=propagate))
+            deps.delete()
+            self.client.delete(key)
 
     @cached_property
     def client(self):

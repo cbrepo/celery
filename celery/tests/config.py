@@ -2,12 +2,7 @@ from __future__ import absolute_import
 
 import os
 
-from kombu import Queue
-
-BROKER_URL = "memory://"
-
-#: warn if config module not found
-os.environ["C_WNOCONF"] = "yes"
+BROKER_TRANSPORT = "memory"
 
 #: Don't want log output when running suite.
 CELERYD_HIJACK_ROOT_LOGGER = False
@@ -20,9 +15,7 @@ CELERY_SEND_TASK_ERROR_EMAILS = False
 CELERY_DEFAULT_QUEUE = "testcelery"
 CELERY_DEFAULT_EXCHANGE = "testcelery"
 CELERY_DEFAULT_ROUTING_KEY = "testcelery"
-CELERY_QUEUES = (
-    Queue("testcelery", routing_key="testcelery"),
-)
+CELERY_QUEUES = {"testcelery": {"binding_key": "testcelery"}}
 
 CELERY_ENABLE_UTC = True
 

@@ -15,17 +15,13 @@ import os
 import sys
 import warnings
 
-from celery.datastructures import AttributeDict
-from celery.exceptions import NotConfigured
-from celery.utils import strtobool
-from celery.utils.imports import NotAPackage, find_module
+from ..datastructures import AttributeDict
+from ..exceptions import NotConfigured
+from ..utils import find_module, NotAPackage
 
 from .base import BaseLoader
 
 DEFAULT_CONFIG_MODULE = "celeryconfig"
-
-#: Warns if configuration file is missing if :envvar:`C_WNOCONF` is set.
-C_WNOCONF = strtobool(os.environ.get("C_WNOCONF", False))
 
 CONFIG_INVALID_NAME = """
 Error: Module '%(module)s' doesn't exist, or it's not a valid \
@@ -63,11 +59,9 @@ class Loader(BaseLoader):
                     CONFIG_INVALID_NAME % {
                         "module": configname}), sys.exc_info()[2]
         except ImportError:
-            # billiard sets this if forked using execv
-            if C_WNOCONF and not os.environ.get("FORKED_BY_MULTIPROCESSING"):
-                warnings.warn(NotConfigured(
-                    "No %r module found! Please make sure it exists and "
-                    "is available to Python." % (configname, )))
+            warnings.warn(NotConfigured(
+                "No %r module found! Please make sure it exists and "
+                "is available to Python." % (configname, )))
             return self.setup_settings({})
         else:
             celeryconfig = self.import_from_cwd(configname)
@@ -79,3 +73,13 @@ class Loader(BaseLoader):
 
     def wanted_module_item(self, item):
         return item[0].isupper() and not item.startswith("_")
+
+    def on_worker_init(self):
+        """Imports modules at worker init so tasks can be registered
+        and used by the worked.
+
+        The list of modules to import is taken from the
+        :setting:`CELERY_IMPORTS` setting.
+
+        """
+        self.import_default_modules()

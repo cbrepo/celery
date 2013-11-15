@@ -11,42 +11,41 @@ Message format
 ==============
 
 * task
-    :`string`:
+    `string`
 
     Name of the task. **required**
 
 * id
-    :`string`:
+    `string`
 
     Unique id of the task (UUID). **required**
 
 * args
-    :`list`:
+    `list`
 
     List of arguments. Will be an empty list if not provided.
 
 * kwargs
-    :`dictionary`:
+    `dictionary`
 
     Dictionary of keyword arguments. Will be an empty dictionary if not
     provided.
 
 * retries
-    :`int`:
+    `int`
 
     Current number of times this task has been retried.
     Defaults to `0` if not specified.
 
 * eta
-    :`string` (ISO 8601):
+    `string` (ISO 8601)
 
     Estimated time of arrival. This is the date and time in ISO 8601
     format. If not provided the message is not scheduled, but will be
     executed asap.
 
 * expires
-    :`string` (ISO 8601):
-
+    `string` (ISO 8601)
     .. versionadded:: 2.0.2
 
     Expiration date. This is the date and time in ISO 8601 format.
@@ -65,40 +64,24 @@ to process it.
 
 
 * taskset
-    :`string`:
+  `string`
 
-    The taskset this task is part of (if any).
+  The taskset this task is part of.
 
 * chord
-    :`subtask`:
+  `object`
+  .. versionadded:: 2.3
 
-    .. versionadded:: 2.3
-
-    Signifies that this task is one of the header parts of a chord.  The value
-    of this key is the body of the cord that should be executed when all of
-    the tasks in the header has returned.
+  Signifies that this task is one of the header parts of a chord.  The value
+  of this key is the body of the cord that should be executed when all of
+  the tasks in the header has returned.
 
 * utc
-    :`bool`:
+  `bool`
+  .. versionadded:: 2.5
 
-    .. versionadded:: 2.5
-
-    If true time uses the UTC timezone, if not the current local timezone
-    should be used.
-
-* callbacks
-    :`<list>subtask`:
-
-    .. versionadded:: 2.6
-
-    A list of subtasks to apply if the task exited successfully.
-
-* errbacks
-    :`<list>subtask`:
-
-    .. versionadded:: 2.6
-
-    A list of subtasks to apply if an error occurs while executing the task.
+  If true time uses the UTC timezone, if not the current local timezone
+  should be used.
 
 Example message
 ===============

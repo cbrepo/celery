@@ -17,14 +17,12 @@ from datetime import datetime, timedelta
 from dateutil import tz
 from dateutil.parser import parse as parse_iso8601
 
-from celery.exceptions import ImproperlyConfigured
-
-from .text import pluralize
+from . import pluralize
 
 try:
     import pytz
-except ImportError:     # pragma: no cover
-    pytz = None         # noqa
+except ImportError:
+    pytz = None  # noqa
 
 
 DAYNAMES = "sun", "mon", "tue", "wed", "thu", "fri", "sat"
@@ -43,6 +41,15 @@ TIME_UNITS = (("day", 60 * 60 * 24.0, lambda n: "%.2f" % n),
               ("second", 1.0, lambda n: "%.2f" % n))
 
 
+class UnknownTimezone(Exception):
+    """No specification exists for the timezone specified.  Consider
+    installing the pytz library to get access to more timezones."""
+
+
+def _is_naive(dt):
+    return bool(dt.tzinfo)
+
+
 class _Zone(object):
 
     def tz_or_local(self, tzinfo=None):
@@ -56,12 +63,12 @@ class _Zone(object):
 
     def get_timezone(self, zone):
         if isinstance(zone, basestring):
-            if pytz is None:
-                if zone == "UTC":
-                    return tz.gettz("UTC")
-                raise ImproperlyConfigured(
-                    "Timezones requires the pytz library")
-            return pytz.timezone(zone)
+            if pytz:
+                return pytz.timezone(zone)
+            zone = tz.gettz(zone)
+            if zone is None:
+                raise UnknownTimezone(UnknownTimezone.__doc__)
+            return zone
         return zone
 
     @cached_property
@@ -71,6 +78,7 @@ class _Zone(object):
     @cached_property
     def utc(self):
         return self.get_timezone("UTC")
+
 timezone = _Zone()
 
 

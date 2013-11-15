@@ -8,10 +8,12 @@ if not os.environ.get("EVENTLET_NOPATCH"):
     eventlet.monkey_patch()
     eventlet.debug.hub_prevent_multiple_readers(False)
 
+import sys
+
 from time import time
 
-from celery import signals
-from celery.utils import timer2
+from .. import signals
+from ..utils import timer2
 
 from . import base
 
@@ -33,8 +35,18 @@ class Schedule(timer2.Schedule):
         self._spawn_after = spawn_after
         self._queue = set()
 
-    def _enter(self, eta, priority, entry):
-        secs = max(eta - time(), 0)
+    def enter(self, entry, eta=None, priority=0):
+        try:
+            eta = timer2.to_timestamp(eta)
+        except OverflowError:
+            if not self.handle_error(sys.exc_info()):
+                raise
+
+        now = time()
+        if eta is None:
+            eta = now
+        secs = max(eta - now, 0)
+
         g = self._spawn_after(secs, entry)
         self._queue.add(g)
         g.link(self._entry_exit, entry)
@@ -42,6 +54,7 @@ class Schedule(timer2.Schedule):
         g.eta = eta
         g.priority = priority
         g.cancelled = False
+
         return g
 
     def _entry_exit(self, g, entry):
@@ -106,8 +119,6 @@ class TaskPool(base.BasePool):
     def on_start(self):
         self._pool = self.Pool(self.limit)
         signals.eventlet_pool_started.send(sender=self)
-        self._quick_put = self._pool.spawn_n
-        self._quick_apply_sig = signals.eventlet_pool_apply.send
 
     def on_stop(self):
         signals.eventlet_pool_preshutdown.send(sender=self)
@@ -117,8 +128,8 @@ class TaskPool(base.BasePool):
 
     def on_apply(self, target, args=None, kwargs=None, callback=None,
             accept_callback=None, **_):
-        self._quick_apply_sig(sender=self,
+        signals.eventlet_pool_apply.send(sender=self,
                 target=target, args=args, kwargs=kwargs)
-        self._quick_put(apply_target, target, args, kwargs,
-                        callback, accept_callback,
-                        self.getpid)
+        self._pool.spawn_n(apply_target, target, args, kwargs,
+                           callback, accept_callback,
+                           self.getpid)

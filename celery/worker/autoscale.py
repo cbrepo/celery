@@ -19,18 +19,11 @@ from __future__ import with_statement
 
 import threading
 
-from functools import partial
 from time import sleep, time
 
-from celery.utils.log import get_logger
-from celery.utils.threads import bgThread
-
 from . import state
-from .abstract import StartStopComponent
-from .hub import DummyLock
-
-logger = get_logger(__name__)
-debug, info, error = logger.debug, logger.info, logger.error
+from ..abstract import StartStopComponent
+from ..utils.threads import bgThread
 
 
 class WorkerComponent(StartStopComponent):
@@ -41,58 +34,39 @@ class WorkerComponent(StartStopComponent):
         self.enabled = w.autoscale
         w.autoscaler = None
 
-    def create_threaded(self, w):
-        scaler = w.autoscaler = self.instantiate(w.autoscaler_cls,
-            w.pool, w.max_concurrency, w.min_concurrency)
-        return scaler
-
-    def on_poll_init(self, scaler, hub):
-        hub.on_task.append(scaler.maybe_scale)
-        hub.timer.apply_interval(scaler.keepalive * 1000.0, scaler.maybe_scale)
-
-    def create_ev(self, w):
-        scaler = w.autoscaler = self.instantiate(w.autoscaler_cls,
-            w.pool, w.max_concurrency, w.min_concurrency,
-            mutex=DummyLock())
-        w.hub.on_init.append(partial(self.on_poll_init, scaler))
-
     def create(self, w):
-        return (self.create_ev if w.use_eventloop
-                               else self.create_threaded)(w)
+        scaler = w.autoscaler = self.instantiate(w.autoscaler_cls, w.pool,
+                                    max_concurrency=w.max_concurrency,
+                                    min_concurrency=w.min_concurrency,
+                                    logger=w.logger)
+        return scaler
 
 
 class Autoscaler(bgThread):
 
-    def __init__(self, pool, max_concurrency, min_concurrency=0, keepalive=30,
-            mutex=None):
+    def __init__(self, pool, max_concurrency, min_concurrency=0,
+            keepalive=30, logger=None):
         super(Autoscaler, self).__init__()
         self.pool = pool
-        self.mutex = mutex or threading.Lock()
+        self.mutex = threading.Lock()
         self.max_concurrency = max_concurrency
         self.min_concurrency = min_concurrency
         self.keepalive = keepalive
+        self.logger = logger
         self._last_action = None
 
         assert self.keepalive, "can't scale down too fast."
 
     def body(self):
         with self.mutex:
-            self.maybe_scale()
+            current = min(self.qty, self.max_concurrency)
+            if current > self.processes:
+                self.scale_up(current - self.processes)
+            elif current < self.processes:
+                self.scale_down(
+                    (self.processes - current) - self.min_concurrency)
         sleep(1.0)
-
-    def _maybe_scale(self):
-        procs = self.processes
-        cur = min(self.qty, self.max_concurrency)
-        if cur > procs:
-            self.scale_up(cur - procs)
-            return True
-        elif cur < procs:
-            self.scale_down((procs - cur) - self.min_concurrency)
-            return True
-
-    def maybe_scale(self):
-        if self._maybe_scale():
-            self.pool.maintain_pool()
+    scale = body  # XXX compat
 
     def update(self, max=None, min=None):
         with self.mutex:
@@ -118,31 +92,33 @@ class Autoscaler(bgThread):
         with self.mutex:
             new = self.processes - n
             if new < self.min_concurrency:
-                self.min_concurrency = max(new, 0)
-            self._shrink(min(n, self.processes))
+                self.min_concurrency = new
+            self._shrink(n)
 
     def scale_up(self, n):
         self._last_action = time()
         return self._grow(n)
 
-    def scale_down(self, n):
-        if n and self._last_action and (
-                time() - self._last_action > self.keepalive):
-            self._last_action = time()
-            return self._shrink(n)
-
     def _grow(self, n):
-        info("Scaling up %s processes.", n)
+        self.logger.info("Scaling up %s processes.", n)
         self.pool.grow(n)
 
     def _shrink(self, n):
-        info("Scaling down %s processes.", n)
+        self.logger.info("Scaling down %s processes.", n)
         try:
             self.pool.shrink(n)
         except ValueError:
-            debug("Autoscaler won't scale down: all processes busy.")
+            self.logger.debug(
+                "Autoscaler won't scale down: all processes busy.")
         except Exception, exc:
-            error("Autoscaler: scale_down: %r", exc, exc_info=True)
+            self.logger.error("Autoscaler: scale_down: %r", exc, exc_info=True)
+
+    def scale_down(self, n):
+        if not self._last_action or not n:
+            return
+        if time() - self._last_action > self.keepalive:
+            self._last_action = time()
+            self._shrink(n)
 
     def info(self):
         return {"max": self.max_concurrency,

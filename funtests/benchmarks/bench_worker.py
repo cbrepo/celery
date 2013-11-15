@@ -11,11 +11,11 @@ if JSONIMP:
 
 print("anyjson implementation: %r" % (anyjson.implementation.name, ))
 
-from celery import Celery, group
+from celery import Celery
 
-DEFAULT_ITS = 40000
+DEFAULT_ITS = 20000
 
-BROKER_TRANSPORT = os.environ.get("BROKER", "librabbitmq")
+BROKER_TRANSPORT = "librabbitmq"
 if hasattr(sys, "pypy_version_info"):
     BROKER_TRANSPORT = "amqplib"
 
@@ -46,7 +46,7 @@ def tdiff(then):
     return time.time() - then
 
 
-@celery.task(cur=0, time_start=None, queue="bench.worker", bare=True)
+@celery.task(cur=0, time_start=None, queue="bench.worker")
 def it(_, n):
     i = it.cur  # use internal counter, as ordering can be skewed
                 # by previous runs, or the broker.
@@ -66,7 +66,7 @@ def it(_, n):
 
 def bench_apply(n=DEFAULT_ITS):
     time_start = time.time()
-    group(it.s(i, n) for i in xrange(n))()
+    celery.TaskSet(it.subtask((i, n)) for i in xrange(n)).apply_async()
     print("-- apply %s tasks: %ss" % (n, time.time() - time_start, ))
 
 
@@ -81,7 +81,6 @@ def bench_work(n=DEFAULT_ITS, loglevel="CRITICAL"):
         print("STARTING WORKER")
         worker.start()
     except SystemExit:
-        raise
         assert sum(worker.state.total_count.values()) == n + 1
 
 
@@ -104,8 +103,8 @@ def main(argv=sys.argv):
         return {"apply": bench_apply,
                 "work": bench_work,
                 "both": bench_both}[argv[1]](n=n)
-    except:
-        raise
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

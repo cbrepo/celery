@@ -3,8 +3,8 @@ from __future__ import with_statement
 
 from kombu.serialization import registry
 
-from celery import current_app
-from celery.exceptions import ImproperlyConfigured
+from .. import current_app
+from ..exceptions import ImproperlyConfigured
 
 from .serialization import register_auth
 
@@ -71,7 +71,7 @@ def setup_security(allowed_serializers=None, key=None, cert=None, store=None,
     cert = cert or conf.CELERY_SECURITY_CERTIFICATE
     store = store or conf.CELERY_SECURITY_CERT_STORE
 
-    if not (key and cert and store):
+    if any(not v for v in (key, cert, store)):
         raise ImproperlyConfigured(SETTING_MISSING)
 
     with open(key) as kf:

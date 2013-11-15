@@ -20,25 +20,15 @@ import threading
 
 from collections import deque
 from contextlib import contextmanager
-from copy import copy
 
 from kombu.common import eventloop
 from kombu.entity import Exchange, Queue
 from kombu.messaging import Consumer, Producer
-from kombu.utils import cached_property
 
-from celery.app import app_or_default
-from celery.utils import uuid
+from ..app import app_or_default
+from ..utils import uuid
 
 event_exchange = Exchange("celeryev", type="topic")
-
-
-def get_exchange(conn):
-    ex = copy(event_exchange)
-    if "redis" in type(conn.transport).__module__:
-        # quick hack for #436
-        ex.type = "fanout"
-    return ex
 
 
 def Event(type, _fields=None, **fields):
@@ -91,8 +81,6 @@ class EventDispatcher(object):
         self.on_disabled = set()
 
         self.enabled = enabled
-        if not connection and channel:
-            self.connection = channel.connection.client
         if self.enabled:
             self.enable()
 
@@ -102,15 +90,9 @@ class EventDispatcher(object):
     def __exit__(self, *exc_info):
         self.close()
 
-    def get_exchange(self):
-        if self.connection:
-            return get_exchange(self.connection)
-        else:
-            return get_exchange(self.channel.connection.client)
-
     def enable(self):
-        self.publisher = Producer(self.channel or self.connection,
-                                  exchange=self.get_exchange(),
+        self.publisher = Producer(self.channel or self.connection.channel(),
+                                  exchange=event_exchange,
                                   serializer=self.serializer)
         self.enabled = True
         for callback in self.on_enabled:
@@ -156,7 +138,10 @@ class EventDispatcher(object):
     def close(self):
         """Close the event dispatcher."""
         self.mutex.locked() and self.mutex.release()
-        self.publisher = None
+        if self.publisher is not None:
+            if not self.channel:  # close auto channel.
+                self.publisher.channel.close()
+            self.publisher = None
 
 
 class EventReceiver(object):
@@ -182,13 +167,10 @@ class EventReceiver(object):
         self.node_id = node_id or uuid()
         self.queue_prefix = queue_prefix
         self.queue = Queue('.'.join([self.queue_prefix, self.node_id]),
-                           exchange=self.get_exchange(),
+                           exchange=event_exchange,
                            routing_key=self.routing_key,
                            auto_delete=True,
                            durable=False)
-
-    def get_exchange(self):
-        return get_exchange(self.connection)
 
     def process(self, type, event):
         """Process the received event by dispatching it to the appropriate
@@ -243,25 +225,30 @@ class Events(object):
     def __init__(self, app=None):
         self.app = app
 
-    @cached_property
-    def Receiver(self):
-        return self.app.subclass_with_self(EventReceiver,
-                                           reverse="events.Receiver")
+    def Receiver(self, connection, handlers=None, routing_key="#",
+            node_id=None):
+        return EventReceiver(connection,
+                             handlers=handlers,
+                             routing_key=routing_key,
+                             node_id=node_id,
+                             app=self.app)
 
-    @cached_property
-    def Dispatcher(self):
-        return self.app.subclass_with_self(EventDispatcher,
-                                           reverse="events.Dispatcher")
+    def Dispatcher(self, connection=None, hostname=None, enabled=True,
+            channel=None, buffer_while_offline=True):
+        return EventDispatcher(connection,
+                               hostname=hostname,
+                               enabled=enabled,
+                               channel=channel,
+                               app=self.app)
 
-    @cached_property
     def State(self):
-        return self.app.subclass_with_self("celery.events.state:State",
-                                           reverse="events.State")
+        from .state import State as _State
+        return _State()
 
     @contextmanager
     def default_dispatcher(self, hostname=None, enabled=True,
             buffer_while_offline=False):
-        with self.app.amqp.producer_pool.acquire(block=True) as pub:
+        with self.app.amqp.publisher_pool.acquire(block=True) as pub:
             with self.Dispatcher(pub.connection, hostname, enabled,
                                  pub.channel, buffer_while_offline) as d:
                 yield d
